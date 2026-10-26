@@ -389,6 +389,20 @@ The Host arena is a bounded variable-size allocator. A plan must verify the exte
 the complete release/allocation recipe; `free_bytes` is only an occupancy summary, not sufficient
 proof of allocatability.
 
+Pressure demotions may span several existing extents. Planning and reservation share the same
+first-fit rule: prefer an extent fitting the whole remainder, otherwise consume a page-aligned
+prefix of the first extent fitting one page. The joint proof follows execution's resource-major
+order (Shared then Private Main KV, then Shared then Private Backend KV), charges both descriptor
+pools and membership capacity after releases, and prices the extra physical copy runs at the exact
+fragment boundaries. Other Host allocations keep their contiguous contract.
+
+Every fragment for a demotion is reserved before DMA starts, and the transaction owns all of them
+before a copy can throw. Failed submissions synchronize transfer streams before releasing source
+pins or Host memory. After copies finish, all fragments pass epoch/coverage preflight before any
+is published; Device replicas are dropped only after publication. Cancellation returns every
+unpublished fragment through the existing reservation lifetime.
+
+
 ### 5.4 Replica transfer
 
 A D2H/H2D transfer copies the complete page payload and can merge adjacent physical IDs into fewer
@@ -420,8 +434,10 @@ on rank 0.
 
 - `DeviceKVPagePool::attach_mirror(mirror, where)`: every `zero_pages`/`copy_page` of the rank 0 pool
   is replayed on the mirror on `where.stream` with the same physical page ID. The mirror must have the
-  same page capacity; once attached, Host transfers are rejected, because the Host tier has no rank 1
-  replica.
+  same page capacity.
+  Host records contain both ranks, rank 0 first and rank 1 at `replica_stride`; the complete
+  two-rank page stays within one extent, including fragmented demotions. Each rank transfers
+  through its own stream, with the existing transfer-order event preserving dependencies.
 - `KVExecutionTablePool::attach_mirror(mirror, where)`: every row acquire/release and publication is
   replayed on the same row of the mirror. Rank 0 holds the mirror's row lease; rank 1 only reads
   through `mirror_row()` and does not `acquire` on its own; at attach time neither pool may have a
