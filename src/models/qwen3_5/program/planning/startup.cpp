@@ -1251,7 +1251,7 @@ void validate_target_options(const execution::Parameters& parameters,
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
+        if (requested_pages < minimum_pages) {
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }
@@ -1691,7 +1691,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    // Physical retention capacity is independent of one request's position limit.
+    // Keep automatic sizing unchanged; an explicit pool may also hold cached COW tails.
+    const auto maximum_pages = options.kv_capacity.mode == KvCapacityMode::Explicit
+                                   ? std::max(static_cast<std::uint32_t>(maximum_pages64),
+                                              page_count(options.kv_capacity.explicit_tokens))
+                                   : static_cast<std::uint32_t>(maximum_pages64);
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
