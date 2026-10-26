@@ -259,6 +259,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--constraint-matcher-mib N] [--constraint-json-strict on|off] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--retain-dormant-shared] [--trace-shared-lifecycle] "
            "[--disk-cache-dir DIR --disk-cache-gib N] [--disk-cache-min-free-gib N] "
            "[--disk-cache-idle-ms N] "
            "[--disk-cache-flush-seconds N] "
@@ -881,6 +882,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-private-continuations"), "max-private-continuations"));
             context_capacity_explicit = true;
+        } else if (arg == "--retain-dormant-shared") {
+            options.context_cache.retain_dormant_shared = true;
+        } else if (arg == "--trace-shared-lifecycle") {
+            options.context_cache.trace_shared_lifecycle = true;
         } else if (arg == "--max-shared-prefixes") {
             options.context_cache.max_shared_prefixes =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

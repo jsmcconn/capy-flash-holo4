@@ -760,6 +760,14 @@ A shared owner has no fixed retention multiplier. `ExplicitBoundary` or `Request
 owner-scoped credit at publication; it is consumed at the first subsequent exact match, or expires
 after 32 successful materializations. Multiple evidence flags at the same frontier do not stack credit.
 
+Dormant shared-prefix retention: an existing Shared checkpoint with no current demand bits and
+no remaining explicit credit receives a one-use capability-transition-loss prior. This uses the
+legacy `private_retention_weight`/`private_transition_loss` fields without adding new capture gain.
+It is absent while empirical demand or explicit credit already values the owner. Expiry still
+occurs after 32 successful materializations; it no longer makes an expensive dormant checkpoint
+free to erase. Actual demotion costs and finite Host/catalog capacity remain authoritative, so
+this is a cost-aware prior, not a pin or a promise of a future reuse.
+
 For the candidate identity state \(I_c\) of a mandatory materialization and a pressure target \(T\):
 
 \[
@@ -1035,8 +1043,7 @@ If the Program can no longer form an explainable stable state, an Engine-wide fa
 ### 10.1 Retention policy
 
 A private retention class affects portfolio value through the owner prior; it does not provide a fixed
-eviction order. A shared owner's value comes from real demand and from explicit credit that has not
-yet expired. The planner can combine:
+eviction order. A shared owner's value comes from real demand, unexpired explicit credit, and the dormant capability prior. The planner can combine:
 
 - deleting redundant replicas;
 - demoting Device replicas to Host-only;
