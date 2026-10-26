@@ -559,7 +559,8 @@ resource errors.
 ## OpenAI prompt caching
 
 Chat Completions and Responses translate OpenAI cache hints into optional shared-prefix write
-candidates:
+candidates. Responses applies this policy after resolving input and `previous_response_id`
+history, so the candidates describe the complete effective prompt:
 
 - omitted `prompt_cache_options` creates a default implicit candidate at the latest representable
   content boundary;

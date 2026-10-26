@@ -207,6 +207,46 @@ int test_budgets_and_nonsemantic_hints() {
     return failures;
 }
 
+int test_resolved_prompt_cache_policy() {
+    const auto marked = [](const ChatTurn& turn) {
+        if (turn.cache_boundary_after) { return true; }
+        for (const ContentPart& content : turn.content) {
+            if (content.cache_boundary_after) { return true; }
+        }
+        return false;
+    };
+    OpenAIResponsesStore store(16, 1ULL << 20);
+    Json body         = {{"model", "m"}, {"input", "Initial request"}};
+    const auto parsed = parse_openai_responses_create_request(body, limits());
+    const auto resolved =
+        resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+    int failures                 = check(parsed.prompt.generation.messages.empty() &&
+                                             resolved.generation.messages.size() == 1 &&
+                                             marked(resolved.generation.messages.back()),
+                                         "Responses implicit caching applies after input messages are resolved");
+    body["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    const auto explicit_request  = parse_openai_responses_create_request(body, limits());
+    const auto explicit_resolved =
+        resolve_openai_responses_prompt(explicit_request.prompt, store, std::nullopt, false);
+    failures += check(!explicit_resolved.generation.messages.empty() &&
+                          !marked(explicit_resolved.generation.messages.back()),
+                      "Responses explicit mode suppresses an implicit write");
+    store.put(stored_parent(
+        append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "Stored request")})));
+    body = Json{{"model", "m"}, {"previous_response_id", "resp_parent"}, {"input", "Follow-up"}};
+    const auto child_request = parse_openai_responses_create_request(body, limits());
+    const auto child =
+        resolve_openai_responses_prompt(child_request.prompt, store, std::nullopt, false);
+    failures +=
+        check(child.generation.messages.size() == 2 && marked(child.generation.messages.back()) &&
+                  !marked(child.generation.messages.front()),
+              "Responses implicit boundary follows the resolved parent and child history");
+    failures +=
+        check(!marked(flatten_openai_response_context(store.get("resp_parent")->context).front()),
+              "Applying a cache policy does not mutate stored parent history");
+    return failures;
+}
+
 int test_typed_items_and_cache_markers() {
     const Json body = {
         {"model", "m"},
@@ -1177,6 +1217,7 @@ int main() {
     int failures = 0;
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
+    failures += test_resolved_prompt_cache_policy();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();

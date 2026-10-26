@@ -1317,8 +1317,8 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     reject_unsupported_platform_fields(body);
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
-    ParsedPromptFields parsed = parse_prompt_fields(body, limits);
-    apply_openai_prompt_cache_policy(parsed.prompt.generation, cache_policy);
+    ParsedPromptFields parsed  = parse_prompt_fields(body, limits);
+    parsed.prompt.cache_policy = cache_policy;
     OpenAIResponsesCreateRequest out;
     out.prompt              = std::move(parsed.prompt);
     out.tools               = std::move(parsed.wire_tools);
