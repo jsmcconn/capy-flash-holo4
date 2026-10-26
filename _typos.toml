@@ -30,3 +30,4 @@ thw = "thw"        # temporal, height, width of a Vision grid (image_grid_thw)
 
 [default.extend-identifiers]
 cudaMemcpy3DParms = "cudaMemcpy3DParms"  # CUDA API
+countr_zero = "countr_zero"  # C++20 standard library API

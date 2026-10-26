@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -26,6 +27,29 @@ struct ContextPortfolioCheckpointValue {
     std::uint64_t target_recovery_ns   = 0;
 };
 
+// Common retention value for bounded preserving-cover construction. Callers keep
+// their established tie-breaks (materialization has hit history; capture uses owner ID).
+template <class CheckpointPolicy>
+[[nodiscard]] std::uint64_t
+pressure_seed_owner_value(PlanningOwnerId owner, std::uint32_t retention_weight,
+                          bool explicit_credit,
+                          std::span<const CheckpointPolicy> checkpoints) noexcept {
+    std::uint64_t saving = 0;
+    std::uint32_t mask   = 0;
+    for (const auto& checkpoint : checkpoints) {
+        if (checkpoint.owner != owner) { continue; }
+        saving = std::max(saving, checkpoint.rebuild_ns > checkpoint.baseline_recovery_ns
+                                      ? checkpoint.rebuild_ns - checkpoint.baseline_recovery_ns
+                                      : 0);
+        mask |= checkpoint.demand_mask;
+    }
+    const auto weight =
+        std::uint64_t(retention_weight) + std::popcount(mask) + unsigned(explicit_credit);
+    return weight != 0 && saving > std::numeric_limits<std::uint64_t>::max() / weight
+               ? std::numeric_limits<std::uint64_t>::max()
+               : saving * weight;
+}
+
 struct ContextPortfolioValueResult {
     std::uint64_t baseline_public_value   = 0;
     std::uint64_t target_public_value     = 0;
@@ -34,8 +58,9 @@ struct ContextPortfolioValueResult {
 };
 
 // Folds one complete inactive checkpoint portfolio. Empirical demands and explicit shared credit
-// form public portfolio values. A private owner contributes the largest loss of one concrete
-// checkpoint capability, so a surviving later checkpoint cannot mask damage to an earlier one.
+// form public portfolio values. A retention-weighted owner contributes the largest loss of one
+// concrete checkpoint capability, so a surviving later checkpoint cannot mask earlier damage.
+// Runtime also uses this legacy private-loss field for a dormant shared owner's one-use prior.
 class ContextPortfolioValue {
 public:
     ContextPortfolioValue() { owner_scratch_.reserve(32U); }
@@ -46,8 +71,13 @@ public:
         std::array<std::uint64_t, 32> baseline_demand{};
         std::array<std::uint64_t, 32> target_demand{};
         owner_scratch_.clear();
+        bool dense_prefix = true;
         for (const ContextPortfolioOwnerPolicy& policy : owners) {
-            if (std::find_if(owner_scratch_.begin(), owner_scratch_.end(), [&](const auto& item) {
+            // Runtime owner IDs are sequential. Keep sparse/opaque IDs supported without
+            // paying a quadratic duplicate check for every complete portfolio fold.
+            dense_prefix = dense_prefix && policy.owner.value == owner_scratch_.size();
+            if (!dense_prefix &&
+                std::find_if(owner_scratch_.begin(), owner_scratch_.end(), [&](const auto& item) {
                     return item.owner == policy.owner;
                 }) != owner_scratch_.end()) {
                 throw std::logic_error("portfolio owner policy ID is duplicated");
@@ -59,9 +89,15 @@ public:
         }
 
         for (const ContextPortfolioCheckpointValue& checkpoint : checkpoints) {
-            const auto owner = std::find_if(
-                owner_scratch_.begin(), owner_scratch_.end(),
-                [&](const OwnerValue& item) { return item.owner == checkpoint.owner; });
+            auto owner = owner_scratch_.end();
+            if (checkpoint.owner.value < owner_scratch_.size() &&
+                owner_scratch_[checkpoint.owner.value].owner == checkpoint.owner) {
+                owner = owner_scratch_.begin() + checkpoint.owner.value;
+            } else {
+                owner = std::find_if(
+                    owner_scratch_.begin(), owner_scratch_.end(),
+                    [&](const OwnerValue& item) { return item.owner == checkpoint.owner; });
+            }
             if (owner == owner_scratch_.end()) {
                 throw std::logic_error("portfolio checkpoint has no owner policy");
             }
@@ -78,8 +114,8 @@ public:
             owner->private_transition_loss =
                 std::max(owner->private_transition_loss,
                          baseline_saving > target_saving ? baseline_saving - target_saving : 0);
-            for (std::uint32_t bit = 0; bit < 32U; ++bit) {
-                if ((checkpoint.demand_mask & (1U << bit)) == 0) { continue; }
+            for (auto mask = checkpoint.demand_mask; mask != 0; mask &= mask - 1U) {
+                const auto bit       = std::countr_zero(mask);
                 baseline_demand[bit] = std::max(baseline_demand[bit], baseline_saving);
                 target_demand[bit]   = std::max(target_demand[bit], target_saving);
             }
