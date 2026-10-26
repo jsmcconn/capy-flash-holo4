@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -1198,6 +1199,7 @@ public:
     [[nodiscard]] std::uint32_t disk_resume_tokens(const FakePreparedPrompt&) const noexcept {
         return disk_tokens;
     }
+
     std::uint32_t disk_tokens                 = 0;
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -1981,6 +1983,107 @@ void test_portfolio_demand_and_owner_aggregation() {
     }
 }
 
+void test_portfolio_dense_sparse_and_shuffled_ids_against_integer_oracle() {
+    using namespace ninfer::runtime;
+    using Wide             = unsigned __int128;
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    std::mt19937_64 random(0xd3a5e123);
+    for (unsigned trial = 0; trial < 1000; ++trial) {
+        const std::size_t count = random() % 65;
+        for (unsigned layout = 0; layout < 3; ++layout) {
+            std::vector<ContextPortfolioOwnerPolicy> owners;
+            std::vector<ContextPortfolioCheckpointValue> checkpoints;
+            const bool wide   = trial % 8 == 0;
+            const auto number = [&] { return wide ? random() : random() % 10000; };
+            for (std::size_t index = 0; index < count; ++index) {
+                const PlanningOwnerId id{
+                    .value = layout == 1 ? 0xf0000000U - 37U * static_cast<std::uint32_t>(index)
+                                         : static_cast<std::uint32_t>(index)};
+                owners.push_back(
+                    {.owner                    = id,
+                     .private_retention_weight = wide ? static_cast<std::uint32_t>(random())
+                                                      : static_cast<std::uint32_t>(random() % 17),
+                     .explicit_shared_credit   = (random() % 2) != 0});
+                for (unsigned n = 0, limit = random() % 5; n < limit; ++n) {
+                    checkpoints.push_back(
+                        {.owner = id,
+                         .demand_mask =
+                             trial % 3 == 0
+                                 ? 0U
+                                 : (trial % 3 == 1 ? 1U << (random() % 32)
+                                                   : static_cast<std::uint32_t>(random())),
+                         .rebuild_ns           = number(),
+                         .baseline_recovery_ns = number(),
+                         .target_recovery_ns   = number()});
+                }
+            }
+            if (layout == 2) std::shuffle(owners.begin(), owners.end(), random);
+            std::array<std::uint64_t, 32> baseline{}, target{};
+            Wide baseline_total = 0, target_total = 0, private_total = 0;
+            for (const auto& owner : owners) {
+                std::uint64_t best_before = 0, best_after = 0, loss = 0;
+                for (const auto& checkpoint : checkpoints) {
+                    if (checkpoint.owner != owner.owner) continue;
+                    const auto before =
+                        checkpoint.rebuild_ns > checkpoint.baseline_recovery_ns
+                            ? checkpoint.rebuild_ns - checkpoint.baseline_recovery_ns
+                            : 0;
+                    const auto after = checkpoint.rebuild_ns > checkpoint.target_recovery_ns
+                                           ? checkpoint.rebuild_ns - checkpoint.target_recovery_ns
+                                           : 0;
+                    best_before      = std::max(best_before, before);
+                    best_after       = std::max(best_after, after);
+                    loss             = std::max(loss, before > after ? before - after : 0);
+                    for (unsigned bit = 0; bit < 32; ++bit)
+                        if (checkpoint.demand_mask & (1U << bit)) {
+                            baseline[bit] = std::max(baseline[bit], before);
+                            target[bit]   = std::max(target[bit], after);
+                        }
+                }
+                private_total += Wide(loss) * owner.private_retention_weight;
+                if (owner.explicit_shared_credit) {
+                    baseline_total += best_before;
+                    target_total += best_after;
+                }
+            }
+            for (unsigned bit = 0; bit < 32; ++bit) {
+                baseline_total += baseline[bit];
+                target_total += target[bit];
+            }
+            const auto clamp = [](Wide value) {
+                return static_cast<std::uint64_t>(std::min(value, Wide(maximum)));
+            };
+            ContextPortfolioValue fold;
+            const auto actual = fold.fold(owners, checkpoints);
+            require(actual.baseline_public_value == clamp(baseline_total) &&
+                        actual.target_public_value == clamp(target_total) &&
+                        actual.private_transition_loss == clamp(private_total) &&
+                        actual.saturated == (baseline_total > maximum || target_total > maximum ||
+                                             private_total > maximum),
+                    "portfolio lookup changed the independent integer result");
+        }
+    }
+    for (const auto& ids : {std::vector<std::uint32_t>{0, 0}, std::vector<std::uint32_t>{1, 1},
+                            std::vector<std::uint32_t>{0, 2, 2}}) {
+        std::vector<ContextPortfolioOwnerPolicy> owners;
+        for (auto id : ids) owners.push_back({.owner = {.value = id}});
+        ContextPortfolioValue fold;
+        bool rejected = false;
+        try {
+            (void)fold.fold(owners, {});
+        } catch (const std::logic_error&) { rejected = true; }
+        require(rejected, "dense lookup accepted a duplicate owner ID");
+    }
+    ContextPortfolioValue fold;
+    bool rejected = false;
+    const std::array owners{ContextPortfolioOwnerPolicy{.owner = {.value = 0}}};
+    const std::array missing{ContextPortfolioCheckpointValue{.owner = {.value = 1}}};
+    try {
+        (void)fold.fold(owners, missing);
+    } catch (const std::logic_error&) { rejected = true; }
+    require(rejected, "dense lookup accepted a checkpoint without an owner");
+}
+
 void test_shared_capture_subtracts_private_transition_loss() {
     using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
 
@@ -2460,12 +2563,12 @@ void test_disk_tier_beats_shorter_memory_match() {
     const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
     (void)finish_active(manager, program, first);
     program.disk_tokens = 17; // 16 in memory: 1 more is under 17/16
-    auto close = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    auto close          = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
     require(close.readiness == Readiness::Ready && close.choice &&
                 close.choice->summary().reusable_prompt_tokens == 16,
             "a disk match barely longer displaced the in-memory endpoint");
     program.disk_tokens = 60;
-    auto longer = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 3);
+    auto longer         = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 3);
     require(longer.readiness == Readiness::Ready && longer.choice &&
                 longer.choice->summary().reusable_prompt_tokens == 0 &&
                 longer.choice->summary().prefix_reuse_path == PrefixReusePath::Root,
@@ -3738,6 +3841,8 @@ int main() {
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
+    run_test("dense sparse portfolio integer oracle",
+             test_portfolio_dense_sparse_and_shuffled_ids_against_integer_oracle);
     run_test("shared capture private transition loss",
              test_shared_capture_subtracts_private_transition_loss);
     run_test("shared capture committed target budget",
