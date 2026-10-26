@@ -512,6 +512,12 @@ int main() {
                           .search_renewals            = 1,
                           .search_discovery_used      = true,
                           .search_overshoot_ns        = 0,
+                          .started_from_maximal       = true,
+                          .host_seed_found            = true,
+                          .deficit_cover_probes       = 4,
+                          .deficit_cover_evictions    = 3,
+                          .deficit_cover_elapsed_ns   = 700,
+                          .pre_search_elapsed_ns      = 3000,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -523,7 +529,13 @@ int main() {
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
                           done.at("materialization").at("search_granted_ns") == 8000 &&
                           done.at("materialization").at("search_renewals") == 1 &&
-                          done.at("materialization").at("search_discovery_used") == true,
+                          done.at("materialization").at("search_discovery_used") == true &&
+                          done.at("materialization").at("started_from_maximal") == true &&
+                          done.at("materialization").at("host_seed_found") == true &&
+                          done.at("materialization").at("deficit_cover_probes") == 4 &&
+                          done.at("materialization").at("deficit_cover_evictions") == 3 &&
+                          done.at("materialization").at("deficit_cover_elapsed_ns") == 700 &&
+                          done.at("materialization").at("pre_search_elapsed_ns") == 3000,
                       "materialization search quality or cumulative budget diagnostics missing");
     failures += check(done.at("request").at("client") == "bench/serve-corpus",
                       "X-Ninfer-Client label missing from the done record");

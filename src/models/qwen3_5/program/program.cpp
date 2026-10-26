@@ -159,6 +159,14 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+std::optional<PressureTargetHandle> PressurePlanningSession::deficit_cover_target(
+    runtime::PlanningCandidateId candidate, std::span<const runtime::PlanningOwnerId> owner_order,
+    bool evict_private_for_publication, std::uint64_t budget_ns,
+    MaterializationSeedDiagnostics& diagnostics) {
+    return impl_->deficit_cover_target(candidate, owner_order, evict_private_for_publication,
+                                       budget_ns, diagnostics);
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);
@@ -235,6 +243,13 @@ PressurePlanningSession::seal_capture(AssessedPressureTarget&& assessed) {
 PressureTargetHandle CapturePressurePlanningSession::identity_target() const {
     if (!candidate_.impl_) { throw std::logic_error("capture pressure candidate is empty"); }
     return session_.identity_target(candidate_id());
+}
+
+std::optional<PressureTargetHandle> CapturePressurePlanningSession::deficit_cover_target(
+    std::span<const runtime::PlanningOwnerId> owner_order, std::uint64_t budget_ns,
+    MaterializationSeedDiagnostics& diagnostics) {
+    return session_.deficit_cover_target(candidate_id(), owner_order, false, budget_ns,
+                                         diagnostics);
 }
 
 runtime::PressureTargetGuidance
@@ -605,8 +620,8 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
             bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(layer.moe.experts));
         }
         if (mtp) {
-            bytes.push_back(
-                execution::Qwen4OffloadExperts::gguf_slot_bytes(parameters.qwen4_mtp->layer.moe.experts));
+            bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(
+                parameters.qwen4_mtp->layer.moe.experts));
         }
         constexpr std::int32_t kProbe = 100;
         const auto base               = execution::Qwen4OffloadExperts::layer_slot_profile(

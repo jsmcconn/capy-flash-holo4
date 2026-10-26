@@ -268,3 +268,5 @@ target_link_libraries(ninfer_qwen4_tf_driver PRIVATE ninfer_engine)
 ninfer_add_test(ninfer_qwen4_gguf_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_gguf_pool.cpp"
   LIBRARIES ninfer_model_runtime)
+ninfer_add_test(ninfer_qwen3_5_host_pressure_seed_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_pressure_seed.cpp")
