@@ -71,6 +71,26 @@ Json parse_sse(const std::string& event) {
     return Json::parse(event.substr(prefix.size(), event.size() - prefix.size() - 2));
 }
 
+int test_full_explicit_marker_set() {
+    Json body                      = base_request();
+    body["messages"][0]["content"] = Json::array();
+    for (int index = 0; index < 4; ++index) {
+        body["messages"][0]["content"].push_back(
+            Json{{"type", "text"},
+                 {"text", "marked prefix"},
+                 {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}});
+    }
+    body["messages"].push_back(Json{{"role", "user"}, {"content", "unmarked follow-up"}});
+    const auto translated = prompt(parse(body).generation);
+    int failures          = check(translated.context_cache.markers.size() == 4,
+                                  "full explicit marker set retains all four writes");
+    for (const auto& marker : translated.context_cache.markers) {
+        failures += check(marker.evidence == ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                          "an implicit target must not displace a full explicit marker set");
+    }
+    return failures;
+}
+
 int test_request_envelope_and_sampling() {
     int failures                  = 0;
     Json body                     = base_request();
@@ -790,6 +810,7 @@ int test_common_objects() {
 
 int main() {
     int failures = 0;
+    failures += test_full_explicit_marker_set();
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();

@@ -572,6 +572,9 @@ One request carries at most four distinct writes. An implicit target occupies on
 coincides with an explicit target; the remaining slots contain the latest explicit boundaries.
 Earlier schema-valid historical breakpoints are accepted but are not new write candidates. Exact
 reads of already-published prefixes do not require the request to repeat a marker.
+When four explicit writes are already present, an absent implicit target does not displace
+any of them.
+
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
