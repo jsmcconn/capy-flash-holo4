@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -273,9 +274,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(pages.drop_device_replica(logical_pages[0]) &&
                pages.drop_device_replica(logical_pages[1]) && !extents.release(second_host_extent),
            "Host-only KV pages remain valid and cannot lose their last replica");
-    const std::array last_reference_release{store::HostKVPageReplicaRelease{
-        .pages = &pages,
-        .page  = logical_pages[1],
+    const std::array last_reference_release{store::HostKVLastReferenceRelease{
+        .pages              = &pages,
+        .page               = logical_pages[1],
+        .address_references = 1,
     }};
     const std::array seven_page_request{
         ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 7}};
@@ -296,6 +298,13 @@ void test_kv_store(ninfer::DeviceContext& device) {
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
+    expect(pages.can_set_writer(logical_pages[1], true),
+           "restored page permits an exclusive writer");
+    pages.set_writer(logical_pages[1], true);
+    expect(
+        !extents.can_allocate_after_page_releases({}, last_reference_release, seven_page_request),
+        "writer-held projected last-reference release received Host allocation credit");
+    pages.set_writer(logical_pages[1], false);
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
            "KV Host restore republishes Device replicas before releasing the extent");
     auto activation = addresses.prepare_activation(*address, 3, 1);
@@ -473,11 +482,52 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.address_references(shared_full) == 3,
            "independent shared branches own distinct partial tails and one shared full page");
     addresses.deactivate(*branch_two);
+    const std::array alias_pages{shared_full};
+    auto alias_backup = extents.prepare(pages, alias_pages);
+    expect(alias_backup.has_value(), "three-way Host alias backup reservation");
+    physical_pages.copy_to_host(extents.device_sources(*alias_backup),
+                                extents.writable_view(*alias_backup), device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*alias_backup));
+    expect(pages.drop_device_replica(shared_full) && pages.address_references(shared_full) == 3,
+           "Host-only page has three inactive address owners");
+    const auto projected_alias_release = [&](std::uint32_t count) {
+        const std::array release{store::HostKVLastReferenceRelease{
+            .pages = &pages, .page = shared_full, .address_references = count}};
+        return extents.can_allocate_after_page_releases({}, release, eight_page_request);
+    };
+    expect(!projected_alias_release(0) && !projected_alias_release(1) &&
+               !projected_alias_release(2) && !projected_alias_release(4),
+           "incomplete or stale projected alias release received allocation credit");
+    expect(projected_alias_release(3),
+           "all three aliased address releases did not contribute exact Host allocation credit");
+    const std::array duplicate_alias_release{
+        store::HostKVLastReferenceRelease{
+            .pages = &pages, .page = shared_full, .address_references = 3},
+        store::HostKVLastReferenceRelease{
+            .pages = &pages, .page = shared_full, .address_references = 3}};
+    expect(
+        !extents.can_allocate_after_page_releases({}, duplicate_alias_release, eight_page_request),
+        "duplicate projected alias release received double allocation credit");
+    pages.pin_source(shared_full);
+    expect(!projected_alias_release(3),
+           "pinned projected alias release received allocation credit");
+    pages.unpin_source(shared_full);
+    expect(pages.address_references(shared_full) == 3 && pages.host_resident(shared_full) &&
+               !pages.device_resident(shared_full) &&
+               host_arena.occupied_bytes() == host_layout.page_stride,
+           "projected alias queries changed retained ownership or physical replicas");
     expect(addresses.release(*branch_one) && pages.address_references(shared_full) == 2 &&
                addresses.release(*branch_two) && pages.address_references(shared_full) == 1 &&
-               addresses.release(*shared) && pages.occupied() == 0 &&
-               physical_pages.allocated_pages() == 0,
+               addresses.release(*shared),
            "shared full-page occupancy survives until its final address reference releases");
+    expect(extents.release_unreferenced() == host_layout.page_stride && pages.occupied() == 0 &&
+               physical_pages.allocated_pages() == 0 && host_arena.occupied_bytes() == 0,
+           "actual three-owner teardown releases one physical Host page exactly once");
+    auto after_alias_teardown = host_arena.allocate(host_layout, 8);
+    expect(after_alias_teardown.has_value(),
+           "actual Host allocation disagrees with all-owner alias-release projection");
+    after_alias_teardown.reset();
 
     const auto mixed_source = addresses.create_active(4, 0, device.stream);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
@@ -627,6 +677,159 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+void test_fragmented_host(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto pool_layout = ninfer::plan_device_kv_page_pool(
+        builder,
+        {.page_group_count = 9,
+         .geometry         = {
+                     .page_tokens        = ninfer::kPagedKVPageSize,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 9, .table_rows = 1});
+    const auto bytes = builder.finish(256);
+    ninfer::DeviceArena mirror_arena(bytes), arena(bytes);
+    ninfer::DeviceKVPagePool mirror({mirror_arena.base(), bytes}, pool_layout);
+    ninfer::DeviceKVPagePool physical({arena.base(), bytes}, pool_layout);
+    ninfer::KVExecutionTablePool tables({arena.base(), bytes}, table_layout, physical);
+    ninfer::CudaCompletionEvent transfer_order(device);
+    physical.attach_mirror(mirror, {.device          = device.device,
+                                    .stream          = device.transfer_stream,
+                                    .transfer_stream = device.stream,
+                                    .transfer_order  = &transfer_order});
+    const auto layout = ninfer::plan_host_kv_page_layout(physical.geometry(), 2);
+    const std::array layouts{layout};
+    ninfer::HostKVArena host(layout.page_stride * 9, layouts);
+    store::LogicalKVPageStore pages(physical, 16);
+    store::HostKVExtentStore extents(host, 16);
+    store::KVAddressSpaceStore addresses(pages, tables, 2, 9);
+    const auto address = addresses.create_active(9, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*address, 9 * ninfer::kPagedKVPageSize, device.stream);
+    addresses.commit_frontier(*address, 9 * ninfer::kPagedKVPageSize);
+    device.synchronize();
+    const auto initial_mapping = read_block_table(tables, 0, 9);
+    std::array<std::vector<unsigned char>, 2> expected;
+    const std::array<ninfer::DeviceKVPagePool*, 2> pools{&physical, &mirror};
+    for (std::size_t rank = 0; rank < pools.size(); ++rank) {
+        const auto& plane = pools[rank]->plane(0);
+        expected[rank].resize(plane.bytes());
+        for (std::size_t i = 0; i < plane.bytes(); ++i) {
+            expected[rank][i] =
+                static_cast<unsigned char>((i * 29 + (i >> 8) * 7 + rank * 101) & 255);
+        }
+        CUDA_CHECK(
+            cudaMemcpy(plane.data, expected[rank].data(), plane.bytes(), cudaMemcpyHostToDevice));
+    }
+    addresses.deactivate(*address);
+    std::vector<store::LogicalKVPageHandle> logical;
+    for (std::uint32_t i = 0; i < 9; ++i) {
+        logical.push_back(addresses.logical_page(*address, i));
+    }
+    auto hole3     = host.allocate(layout, 3);
+    auto separator = host.allocate(layout, 1);
+    auto hole5     = host.allocate(layout, 5);
+    hole3.reset();
+    hole5.reset();
+    const auto membership = std::span<const store::LogicalKVPageHandle>(logical).first(8);
+    const std::array request{ninfer::HostKVAllocationRequest{&layout, 8}};
+    expect(!extents.prepare(pages, membership),
+           "negative control: contiguous Store rejects fragmented capacity");
+    expect(extents.can_allocate_after_page_releases({}, {}, request, {.allow_fragmented = true}) &&
+               !extents.can_allocate_after_page_releases(
+                   {}, {}, request, {.allow_fragmented = true, .max_target_allocations = 1}),
+           "fragmented Store proof checks the extent budget without changing ownership");
+    expect(!extents.prepare_fragmented(pages, logical),
+           "insufficient aggregate capacity rejects after partial reservation");
+    const std::array duplicate{logical[0], logical[0]};
+    expect(!extents.prepare_fragmented(pages, duplicate),
+           "fragmented Store rejects duplicate source membership");
+    for (const auto page : logical) {
+        expect(pages.source_pins(page) == 0, "failed prepare must unpin every source");
+    }
+    expect(extents.occupied() == 0 && host.free_bytes() == layout.page_stride * 8,
+           "failed fragmented prepare returns every extent and membership slot");
+    auto cancelled = extents.prepare_fragmented(pages, membership);
+    expect(cancelled && cancelled->size() == 2, "fragmented Store reserves two existing extents");
+    cancelled.reset();
+    for (const auto page : logical) {
+        expect(pages.source_pins(page) == 0, "cancel must unpin every source");
+    }
+    expect(extents.occupied() == 0 && host.free_bytes() == layout.page_stride * 8,
+           "fragmented cancellation returns capacity");
+    auto in_flight = extents.prepare_fragmented(pages, membership);
+    if (!in_flight) { throw std::bad_alloc(); }
+    physical.copy_to_host(extents.device_sources(in_flight->front()),
+                          extents.writable_view(in_flight->front()), device.transfer_stream);
+    // The transaction's CopyPreparation catch uses this same wait-before-abort order,
+    // including the mirror transfer stream, when a later copy throws.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    in_flight.reset();
+    for (const auto page : logical) {
+        expect(pages.source_pins(page) == 0,
+               "in-flight cancellation releases source pins after synchronization");
+    }
+    expect(extents.occupied() == 0 && host.free_bytes() == layout.page_stride * 8,
+           "in-flight fragmented cancellation returns every reserved extent");
+    auto backups = extents.prepare_fragmented(pages, membership);
+    if (!backups) { throw std::bad_alloc(); }
+    for (auto& backup : *backups) {
+        physical.copy_to_host(extents.device_sources(backup), extents.writable_view(backup),
+                              device.transfer_stream);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (const auto& backup : *backups) {
+        expect(extents.can_publish(backup), "all fragments preflight before publication");
+    }
+    std::vector<store::HostKVExtentCapability> capabilities;
+    for (auto& backup : *backups) { capabilities.push_back(extents.publish(std::move(backup))); }
+    for (const auto page : membership) {
+        expect(pages.drop_device_replica(page),
+               "fragmented Host publication permits Device demotion");
+    }
+    // Poison both ranks after demotion so a missing restore cannot pass on stale Device bytes.
+    for (auto* pool : pools) {
+        CUDA_CHECK(cudaMemset(pool->plane(0).data, 0xc3, pool->plane(0).bytes()));
+    }
+    auto reservation = physical.reserve(8);
+    if (!reservation) { throw std::bad_alloc(); }
+    for (const auto capability : capabilities) {
+        const auto view = extents.view(capability);
+        std::vector<ninfer::DeviceKVPageHandle> destinations;
+        for (const auto page : membership) {
+            if (pages.host_replica(page).extent == capability) {
+                destinations.push_back(pages.reserve_device_replica(page, *reservation));
+            }
+        }
+        physical.copy_from_host(view, destinations, device.transfer_stream);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (const auto page : membership) { pages.publish_device_replica(page); }
+    auto activation = addresses.prepare_activation(*address, 9, 0);
+    addresses.commit_activation(std::move(activation), device.stream);
+    device.synchronize();
+    const auto restored_mapping = read_block_table(tables, 0, 9);
+    for (std::size_t rank = 0; rank < pools.size(); ++rank) {
+        const auto& plane = pools[rank]->plane(0);
+        std::vector<unsigned char> actual(plane.bytes());
+        CUDA_CHECK(cudaMemcpy(actual.data(), plane.data, plane.bytes(), cudaMemcpyDeviceToHost));
+        for (std::size_t page = 0; page < membership.size(); ++page) {
+            const auto old_begin = expected[rank].begin() + initial_mapping[page] * plane.nb[3];
+            const auto new_begin = actual.begin() + restored_mapping[page] * plane.nb[3];
+            expect(
+                std::equal(old_begin, old_begin + layout.planes[0].page_payload_bytes, new_begin),
+                "fragmented TP2 Host round trip preserves each rank's BF16 bytes exactly");
+        }
+    }
+    for (const auto capability : capabilities) {
+        expect(extents.release(capability), "restored fragment releases Host replica");
+    }
+    addresses.deactivate(*address);
+    expect(addresses.release(*address) && pages.occupied() == 0 && extents.occupied() == 0 &&
+               physical.allocated_pages() == 0 && host.free_bytes() == layout.page_stride * 8,
+           "fragmented TP2 round trip closes every owner");
+}
+
 } // namespace
 
 int main() {
@@ -642,6 +845,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_fragmented_host(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

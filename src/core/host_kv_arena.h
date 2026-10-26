@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <utility>
@@ -166,6 +167,14 @@ struct HostKVSuballocationRelease {
     std::uint32_t page_count = 0;
 };
 
+struct HostKVAllocationSimulationOptions {
+    bool allow_fragmented              = false;
+    std::size_t max_target_allocations = std::numeric_limits<std::size_t>::max();
+    // Optional per-request fragment counts; outputs are meaningful only on success.
+    std::span<std::uint32_t> fragment_counts;
+    std::vector<std::uint32_t>* fragment_pages = nullptr;
+};
+
 class HostKVAllocationRecipe {
 public:
     HostKVAllocationRecipe() noexcept                                    = default;
@@ -221,6 +230,8 @@ public:
                                     std::uint32_t pages) const noexcept;
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
+    [[nodiscard]] std::uint32_t first_fit_prefix(const HostKVPageLayout& layout,
+                                                 std::uint32_t pages) const noexcept;
 
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,
@@ -228,7 +239,8 @@ public:
 
     [[nodiscard]] bool can_allocate_after_suballocation_releases(
         std::span<const HostKVSuballocationRelease> proposed_releases,
-        std::span<const HostKVAllocationRequest> target_allocations) const;
+        std::span<const HostKVAllocationRequest> target_allocations,
+        HostKVAllocationSimulationOptions options = {}) const;
 
     // The caller supplies already-sized empty outputs so successful adoption cannot allocate.
     // A false return leaves the arena and every input allocation unchanged.
@@ -260,6 +272,10 @@ private:
         std::size_t offset = 0;
         std::size_t bytes  = 0;
     };
+
+    [[nodiscard]] static std::uint32_t first_fit_prefix(std::span<const FreeExtent> extents,
+                                                        std::size_t stride,
+                                                        std::uint32_t pages) noexcept;
 
     [[nodiscard]] std::optional<std::uint32_t>
     find_layout(const HostKVPageLayout& layout) const noexcept;

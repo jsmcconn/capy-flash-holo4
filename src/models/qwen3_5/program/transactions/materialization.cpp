@@ -609,7 +609,7 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
 
-    const detail::PhysicalResources after   = owner_exclusive_resources(source);
+    const detail::PhysicalResources after = owner_exclusive_resources(source);
     const detail::PhysicalResources removed =
         checked_resource_difference(before, after, "consumed source release");
     (void)checked_resource_difference(details.demand.final_removed, removed,
@@ -1567,16 +1567,45 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
         }
         if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate) { return; }
         if (!host_kv_extents) { throw std::logic_error("Host KV extent store is unavailable"); }
-        std::optional<HostKVExtentReservation> reserved =
-            host_kv_extents->prepare(pages, change.pages);
-        if (!reserved) { throw std::bad_alloc(); }
         if (change.sources.size() != change.pages.size()) {
             throw std::logic_error("pressure KV source backing was not prepared");
         }
-        host_kv_extents->device_sources(*reserved, change.sources);
-        pages.physical_pool().copy_to_host(
-            change.sources, host_kv_extents->writable_view(*reserved), device.transfer_stream);
-        change.backup.emplace(std::move(*reserved));
+        auto reserved = host_kv_extents->prepare_fragmented(pages, change.pages);
+        if (!reserved) { throw std::bad_alloc(); }
+        // Own every reservation in the transaction before any copy may throw. Its failure
+        // path synchronizes the transfer streams before clearing these reservations.
+        change.backups     = std::move(*reserved);
+        std::size_t offset = 0;
+        for (const auto& backup : change.backups) {
+            const auto count = host_kv_extents->page_count(backup);
+            host_kv_extents->device_sources(
+                backup, std::span<DeviceKVPageHandle>(change.sources).subspan(offset, count));
+            offset += count;
+        }
+        const auto& layout = host_kv_extents->page_layout(pages);
+        const auto& pool   = pages.physical_pool();
+        const auto whole =
+            plan_host_kv_transfer_work(layout, static_cast<std::uint32_t>(change.pages.size()),
+                                       pool.contiguous_run_count(change.sources));
+        std::uint64_t operations = 0;
+        offset                   = 0;
+        for (auto& backup : change.backups) {
+            const auto count = host_kv_extents->page_count(backup);
+            const auto sources =
+                std::span<const DeviceKVPageHandle>(change.sources).subspan(offset, count);
+            operations +=
+                plan_host_kv_transfer_work(layout, count, pool.contiguous_run_count(sources))
+                    .copy_operations;
+            pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(backup),
+                                               device.transfer_stream);
+            offset += count;
+        }
+        if (operations < whole.copy_operations ||
+            operations - whole.copy_operations > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::logic_error("fragmented Host transfer operation count is invalid");
+        }
+        change.fragment_copy_operations =
+            static_cast<std::uint32_t>(operations - whole.copy_operations);
     };
     const SequenceKVBundle* kv = sequence != nullptr ? (sequence->kv ? &*sequence->kv : nullptr)
                                                      : (shared->kv ? &*shared->kv : nullptr);
@@ -1606,9 +1635,9 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
     work.submitted = std::any_of(work.state_changes.begin(), work.state_changes.end(),
                                  [](const auto& change) { return change.transfer.has_value(); }) ||
                      std::any_of(work.main_kv_changes.begin(), work.main_kv_changes.end(),
-                                 [](const auto& change) { return change.backup.has_value(); }) ||
+                                 [](const auto& change) { return !change.backups.empty(); }) ||
                      std::any_of(work.backend_kv_changes.begin(), work.backend_kv_changes.end(),
-                                 [](const auto& change) { return change.backup.has_value(); });
+                                 [](const auto& change) { return !change.backups.empty(); });
 }
 
 void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
@@ -1644,17 +1673,22 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
                 MaterializationTransaction::PressureWork::KVChangeWork& change) {
                 if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate) {
                     if (change.host_released) { return; }
-                    if (!host_kv_extents || change.backup) { std::terminate(); }
+                    if (!host_kv_extents || !change.backups.empty()) { std::terminate(); }
                     if (!host_kv_extents->release_page_replicas(pages, change.pages)) {
                         std::terminate();
                     }
                     work.mutation_published = true;
                     return;
                 }
-                if (change.backup) {
+                if (!change.backups.empty()) {
                     if (!host_kv_extents) { std::terminate(); }
-                    (void)host_kv_extents->publish(std::move(*change.backup));
-                    change.backup.reset();
+                    for (const auto& backup : change.backups) {
+                        if (!host_kv_extents->can_publish(backup)) { std::terminate(); }
+                    }
+                    for (auto& backup : change.backups) {
+                        (void)host_kv_extents->publish(std::move(backup));
+                    }
+                    change.backups.clear();
                 }
                 for (const LogicalKVPageHandle page : change.pages) {
                     if (!pages.drop_device_replica(page)) { std::terminate(); }
@@ -1698,8 +1732,8 @@ void ProgramImpl::abort_pressure_work(MaterializationTransaction::PressureWork& 
                 change.transfer.reset();
             }
         }
-        for (auto& change : work.main_kv_changes) { change.backup.reset(); }
-        for (auto& change : work.backend_kv_changes) { change.backup.reset(); }
+        for (auto& change : work.main_kv_changes) { change.backups.clear(); }
+        for (auto& change : work.backend_kv_changes) { change.backups.clear(); }
         work.state_changes.clear();
         work.main_kv_changes.clear();
         work.backend_kv_changes.clear();
@@ -1995,6 +2029,23 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                 pressure_transition.timer_mask |= static_cast<std::uint8_t>(1U << resource_index);
                 for_each_pending_pressure(
                     [&](const MaterializationTransaction::PressureWork& work) {
+                        const auto add_fragments = [&](const auto& changes) {
+                            auto& operations =
+                                pressure_transition.transfer_work[resource_index].copy_operations;
+                            for (const auto& change : changes) {
+                                const auto sum = static_cast<std::uint64_t>(operations) +
+                                                 change.fragment_copy_operations;
+                                operations = sum > std::numeric_limits<std::uint32_t>::max()
+                                                 ? std::numeric_limits<std::uint32_t>::max()
+                                                 : static_cast<std::uint32_t>(sum);
+                            }
+                        };
+                        if (resource == runtime::ContextResourceClass::MainKV) {
+                            add_fragments(work.main_kv_changes);
+                        }
+                        if (resource == runtime::ContextResourceClass::BackendKV) {
+                            add_fragments(work.backend_kv_changes);
+                        }
                         for (const runtime::ContextTransferRequirement& requirement :
                              work.option.transfer_requirements) {
                             if (requirement.resource != resource ||
