@@ -1062,6 +1062,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--disk-cache-min-free-gib N` | free space the file system keeps at least; the disk tier evicts, then skips saves | `max(10, 5 % of the file system)` |
 | `--disk-cache-idle-ms N` | Engine inactivity after which retained conversations not yet on disk are written (`0`: only at shutdown) | `5000` |
 | `--disk-cache-flush-seconds N` | at SIGTERM/SIGINT, the time allowed to write the conversations not yet on disk | `60` |
+| `--retain-dormant-shared` | retain a rebuild-cost prior for inactive shared prefixes after explicit credit expires; does not guarantee residency | off |
+| `--trace-shared-lifecycle` | emit shared-prefix creation, replacement and removal diagnostics on stderr, without prompt text | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |

@@ -681,6 +681,15 @@ Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `Request
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
 同一 frontier 的多个 evidence 不叠加 credit。
 
+Dormant shared-prefix retention: an existing Shared checkpoint with no current demand bits and
+no remaining explicit credit receives a one-use capability-transition-loss prior. This uses the
+legacy `private_retention_weight`/`private_transition_loss` fields without adding new capture gain.
+It is absent while empirical demand or explicit credit already values the owner. Expiry still
+occurs after 32 successful materializations; it no longer makes an expensive dormant checkpoint
+free to erase. Actual demotion costs and finite Host/catalog capacity remain authoritative, so
+this is a cost-aware prior, not a pin or a promise of a future reuse.
+
+
 对 mandatory materialization 的 candidate identity state \(I_c\) 和 pressure target \(T\)：
 
 \[
@@ -918,7 +927,7 @@ Abort 保证：
 ### 10.1 Retention policy
 
 Private retention class 通过 owner prior 影响 portfolio value，不提供固定 eviction 顺序。Shared owner 的价值
-来自真实 demand 与尚未到期的 explicit credit。Planner 可以组合：
+来自真实 demand、尚未到期的 explicit credit，以及上述 dormant capability prior。Planner 可以组合：
 
 - 删除冗余 replica；
 - 将 Device replica 降为 Host-only；

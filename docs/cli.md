@@ -364,3 +364,10 @@ tower's GPU pays for it alone; `--max-vision-tokens` shrinks the encode workspac
   --vision --vision-device 1 --max-context 8192 \
   --messages examples/cli/messages/image_chart.json
 ```
+
+Optional shared-cache diagnostics: `--trace-shared-lifecycle` emits source creation,
+normal replacement, pressure/lease/abort/cleanup removal, credit expiry and
+complete Shared catalog snapshots on stderr. It is off by default and contains
+ids/frontiers/policy weights, not prompt text. `--retain-dormant-shared` enables
+the dormant Shared transition-loss prior; it is independently off by default.
+Lifecycle traces are causal diagnostics, not timing qualification runs.

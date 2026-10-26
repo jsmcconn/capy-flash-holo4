@@ -163,6 +163,10 @@ struct ContextCacheOptions {
     // set (--host-state-slots / --host-kv-mib, or a profile). Engine::options() returns those
     // effective values.
     bool enabled = true;
+    // Opt-in retention prior for inactive shared histories.
+    bool retain_dormant_shared = false;
+    // Diagnostic Shared catalog lifecycle events on stderr; does not change policy.
+    bool trace_shared_lifecycle = false;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
@@ -312,7 +316,8 @@ struct RoutedExpertOptions {
     // CPU threads of the missing experts with ggml block banks (they replace cpu_threads there):
     // their decode-once kernels are compute-bound at 6 threads and reach the RAM bandwidth at 12
     // (one per physical core of the 9900X; T219: replay decode 196.7 -> 204.9 tok/s at 6 -> 12).
-    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the 9900X).
+    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the
+    // 9900X).
     std::uint32_t gguf_cpu_threads = 0;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
@@ -1327,9 +1332,9 @@ struct LoadSummary {
     std::uint64_t host_mapped_bytes = 0;
     // v0.7 pinned fallback (EngineOptions::host_pinned_max_bytes): the host-mapped weights kept in
     // pageable memory instead (with alignment) and how many parents; 0 when all are page-locked.
-    std::uint64_t host_pageable_bytes  = 0;
-    std::size_t host_pageable_objects  = 0;
-    std::size_t host_mapped_objects    = 0;
+    std::uint64_t host_pageable_bytes     = 0;
+    std::size_t host_pageable_objects     = 0;
+    std::size_t host_mapped_objects       = 0;
     std::uint64_t host_pinned_limit_bytes = 0;
     bool host_pinned_alloc_failed         = false;
     std::vector<LoadDeviceSummary> devices; // One entry per tensor-parallel rank.

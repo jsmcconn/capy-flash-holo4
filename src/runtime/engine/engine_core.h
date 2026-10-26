@@ -79,7 +79,9 @@ public:
                      // A tp 2 server without Host StateImages has nowhere to put a prefill
                      // checkpoint when the Device pool is full. With them, and at tp 1, the
                      // checkpoint spills to the Host as upstream's does.
-                     options.tp > 1 && options.context_cache.host_state_slots == 0) {
+                     options.tp > 1 && options.context_cache.host_state_slots == 0,
+                     options.context_cache.retain_dormant_shared,
+                     options.context_cache.trace_shared_lifecycle ? stderr : nullptr) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -1483,9 +1485,9 @@ private:
                      "[engine] warning: admission planning of request %llu failed (%s); the "
                      "request is rejected, the engine keeps serving\n",
                      static_cast<unsigned long long>(request->id), failure.c_str());
-        (void)remove_pending_error(
-            request, std::make_exception_ptr(std::runtime_error(
-                         "context-cache admission planning failed: " + failure)));
+        (void)remove_pending_error(request,
+                                   std::make_exception_ptr(std::runtime_error(
+                                       "context-cache admission planning failed: " + failure)));
         return std::nullopt;
     }
 
@@ -2078,7 +2080,7 @@ public:
         const auto started  = Clock::now();
         const auto deadline = started + std::chrono::seconds(program.disk_cache_flush_seconds());
         std::size_t saved = 0, failed = 0;
-        bool drained      = false;
+        bool drained = false;
         try {
             std::scoped_lock execution_lock(execution_mutex_);
             if (!failed_ && !program.has_context_transaction()) {
@@ -2099,7 +2101,8 @@ public:
             std::fprintf(stderr,
                          "[disk-kv] shutdown: %zu conversation(s) saved, %zu failed, %s in %.1f s; "
                          "%s\n",
-                         saved, failed, drained ? "all written" : "deadline reached (unfinished dropped)",
+                         saved, failed,
+                         drained ? "all written" : "deadline reached (unfinished dropped)",
                          std::chrono::duration<double>(Clock::now() - started).count(),
                          program.disk_cache_status().c_str());
         } catch (const std::exception& error) {
