@@ -1,8 +1,9 @@
 name: lint
 on:
+  workflow_dispatch:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/context-cache-improvements]
 permissions:
   contents: read
 jobs:
@@ -18,5 +19,9 @@ jobs:
       - run: pip install pre-commit==4.3.0
       - name: hooks on the changed files
         env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: pre-commit run --show-diff-on-failure --from-ref "$BASE" --to-ref HEAD
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          if [[ "$BASE" =~ ^0+$ ]] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE=origin/main
+          fi
+          pre-commit run --show-diff-on-failure --from-ref "$BASE" --to-ref HEAD
