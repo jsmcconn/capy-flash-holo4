@@ -1,4 +1,10 @@
 
+
+> This branch adds optional context-cache retention, fragmented Host storage and
+> captured peer transport to upstream capy-flash. See the
+> [extension guide](docs/maintainer/context-cache-extensions.md) for behavior,
+> defaults, validation and limitations.
+
 <h1 align="center"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/logo/capy-flash-lockup-dark.svg">
   <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
