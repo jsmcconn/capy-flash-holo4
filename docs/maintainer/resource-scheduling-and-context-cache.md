@@ -779,7 +779,15 @@ Target、工作量和 session storage 仍独立有界。
 Identity 与 root maximal correctness assessment 不因 optional 额度耗尽而取消。时间在 Program
 operation 之间检查，估计误差可造成单步越界；最终 seal 仍必须完成。因此预算只影响 cache quality，
 不改变 mandatory readiness，也不承诺整个 planning 调用可在任意时刻中断。
-Shared capture 维持独立的固定 target budget 与 Skip incumbent。
+Shared capture 维持 Skip incumbent。一个 capture 的所有 replacement scenarios 共用 4096 个
+assessment 上限和同一个 `PlanningAllowance` / economic search budget，不按 scenario 重置。
+先按乐观净收益上界（降序）、stable scenario ordinal（升序）排列，再先检查 identities，后做 expansion。
+上界把非直接 victim 的 checkpoint recovery 降为零，保留固定 victim / candidate recovery，并忽略
+非负 private loss / immediate cost；因此 alias 释放可以改善 survivor recovery 时仍成立。只有上界
+不可能胜过 incumbent（包括 degradation、drop、scenario、target tie-break）时才做 exact pruning；
+feasible identity 本身不证明最优。上界未闭合时搜索是 bounded best effort，并报告 targets、elapsed、
+budget stops 和 optimistic residual regret。Cancellation 跳过尚未开始的 optional capture。
+Program 仍独占 physical feasibility、seal 和事务 adoption 的正确性。
 
 ### 8.8 目标函数与确定性
 

@@ -406,6 +406,20 @@ Program::checkpoint_recovery_work(const ContinuationHandle& owner,
     return impl_->checkpoint_recovery_work(owner, checkpoint);
 }
 
+std::vector<runtime::CheckpointRecoveryAlternativeWork> Program::capture_recovery_lower_bound_work(
+    std::vector<runtime::CheckpointRecoveryAlternativeWork> work) {
+    for (auto& alternative : work) {
+        alternative.transfers[static_cast<std::size_t>(
+            runtime::ContextTransferDirection::DeviceToHost)]   = {};
+        alternative.transfers[static_cast<std::size_t>(
+            runtime::ContextTransferDirection::DeviceToDevice)] = {};
+        alternative
+            .transfers[static_cast<std::size_t>(runtime::ContextTransferDirection::HostToDevice)]
+            .copy_operations = 0;
+    }
+    return work;
+}
+
 CapturePressurePlanningSession Program::begin_capture_pressure_planning(
     const CaptureAssessment& assessment, std::span<const ContinuationHandle* const> private_owners,
     std::span<const runtime::PlanningOwnerId> private_owner_ids,

@@ -976,6 +976,11 @@ public:
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const SharedPrefixHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
+    // Active capture pressure only removes/demotes existing replicas. It cannot promote a
+    // Host-only checkpoint. Missing H2D bytes and rebuild intervals are therefore lower bounds;
+    // transfer call counts may coalesce and alias-eliminable D2D is not a lower bound.
+    [[nodiscard]] static std::vector<runtime::CheckpointRecoveryAlternativeWork>
+    capture_recovery_lower_bound_work(std::vector<runtime::CheckpointRecoveryAlternativeWork> work);
     [[nodiscard]] CapturePressurePlanningSession
     begin_capture_pressure_planning(const CaptureAssessment& assessment,
                                     std::span<const ContinuationHandle* const> private_owners,

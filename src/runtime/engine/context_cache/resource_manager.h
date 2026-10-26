@@ -538,6 +538,13 @@ public:
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }
+        if (cancellation.flag && cancellation.flag->load(std::memory_order_relaxed)) {
+            program.skip_capture(std::move(offer));
+            return ActiveCaptureReserveResult::Skipped;
+        }
+        PlanningAllowance capture_allowance =
+            PlanningAllowance::boundary(blocked_runnable_requests, planning_now_ns<SearchClock>());
+        capture_allowance.cancellation = cancellation.flag;
         rebuild_prefix_index();
 
         CaptureAssessment private_baseline =
@@ -600,10 +607,13 @@ public:
             std::uint64_t replacement_id          = 0;
             std::uint64_t replacement_revision    = 0;
             std::uint32_t stable_ordinal          = 0;
+            std::uint64_t upper_bound             = 0;
+            bool complete                         = false;
         };
 
         struct SelectedCapture {
             CaptureScenario scenario;
+            std::size_t scenario_index = 0;
             typename CapturePlanner::Result plan;
         };
 
@@ -657,14 +667,16 @@ public:
             const auto append_private_checkpoint = [&](PlanningOwnerId owner, std::uint32_t slot,
                                                        const auto& checkpoint) {
                 const CatalogEntry& entry = catalog_[slot];
+                const auto recovery =
+                    program.checkpoint_recovery_work(*entry.handle, checkpoint.ref);
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
-                    .owner                = owner,
-                    .checkpoint           = checkpoint.ref,
-                    .demand_mask          = committed_demand_mask_for(checkpoint.shortlist_key),
-                    .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
-                    .baseline_recovery_ns = price_checkpoint_recovery_work(
-                        cost_model_,
-                        program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                    .owner                  = owner,
+                    .checkpoint             = checkpoint.ref,
+                    .demand_mask            = committed_demand_mask_for(checkpoint.shortlist_key),
+                    .rebuild_ns             = cost_model_.prefill_ns(checkpoint.rebuild_work),
+                    .baseline_recovery_ns   = price_checkpoint_recovery_work(cost_model_, recovery),
+                    .optimistic_recovery_ns = price_checkpoint_recovery_work(
+                        cost_model_, program.capture_recovery_lower_bound_work(recovery)),
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -726,24 +738,63 @@ public:
                         entry, committed_demand_mask_for(entry.summary.checkpoint.shortlist_key)),
                     .explicit_shared_credit = entry.explicit_credit,
                 });
+                const auto recovery =
+                    program.checkpoint_recovery_work(*entry.handle, entry.summary.checkpoint.ref);
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
                     .owner      = owner,
                     .checkpoint = entry.summary.checkpoint.ref,
                     .demand_mask =
                         committed_demand_mask_for(entry.summary.checkpoint.shortlist_key),
                     .rebuild_ns = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
-                    .baseline_recovery_ns = price_checkpoint_recovery_work(
-                        cost_model_, program.checkpoint_recovery_work(
-                                         *entry.handle, entry.summary.checkpoint.ref)),
+                    .baseline_recovery_ns   = price_checkpoint_recovery_work(cost_model_, recovery),
+                    .optimistic_recovery_ns = price_checkpoint_recovery_work(
+                        cost_model_, program.capture_recovery_lower_bound_work(recovery)),
                 });
             }
 
-            const std::uint32_t scenario_budget =
-                scenarios.empty()
-                    ? 0
-                    : std::max<std::uint32_t>(1U, CapturePlanner::kTargetBudget /
-                                                      static_cast<std::uint32_t>(scenarios.size()));
-            for (CaptureScenario& scenario : scenarios) {
+            const auto policy_input = [&](const CaptureScenario& scenario) {
+                std::optional<PlanningOwnerId> victim;
+                if (scenario.replacement) {
+                    for (const auto& record : capture_owner_records) {
+                        if (record.capability.owner.kind == LogicalOwnerKind::SharedPrefix &&
+                            record.capability.slot == scenario.publication_slot) {
+                            victim = record.id;
+                            break;
+                        }
+                    }
+                    if (!victim) { throw std::logic_error("capture replacement has no owner"); }
+                }
+                return typename CapturePlanner::Input{
+                    .capture              = &scenario.assessment,
+                    .owner_policies       = owner_policies,
+                    .checkpoint_policies  = checkpoint_policies,
+                    .direct_shared_victim = victim,
+                    .candidate_demand_mask =
+                        committed_demand_mask_for(scenario.assessment.shortlist_key),
+                    .candidate_rebuild_ns =
+                        cost_model_.prefill_ns(scenario.assessment.protected_rebuild_work),
+                    .private_baseline_immediate_ns = price_context_transfer_requirements(
+                        cost_model_, private_baseline.transfer_requirements),
+                    .blocked_runnable_requests = blocked_runnable_requests,
+                    .stable_scenario_ordinal   = scenario.stable_ordinal,
+                    .allowance                 = capture_allowance,
+                };
+            };
+            for (auto& scenario : scenarios) {
+                scenario.upper_bound =
+                    capture_planner_.upper_bound(policy_input(scenario), cost_model_);
+            }
+            std::stable_sort(scenarios.begin(), scenarios.end(),
+                             [](const auto& lhs, const auto& rhs) {
+                                 return lhs.upper_bound != rhs.upper_bound
+                                            ? lhs.upper_bound > rhs.upper_bound
+                                            : lhs.stable_ordinal < rhs.stable_ordinal;
+                             });
+            CaptureSearchControl search(capture_allowance,
+                                        scenarios.empty() ? 0 : scenarios.front().upper_bound,
+                                        planning_now_ns<SearchClock>());
+            const auto evaluate = [&](CaptureScenario& scenario, std::uint32_t target_budget,
+                                      bool allow_deficit_seed) {
                 std::vector<const ContinuationHandle*> private_owners;
                 std::vector<PlanningOwnerId> private_owner_ids;
                 std::vector<const SharedPrefixHandle*> shared_owners;
@@ -788,47 +839,87 @@ public:
                             owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
                     }
                 }
-                const typename CapturePlanner::Input input{
-                    .capture             = &scenario.assessment,
-                    .private_owners      = private_owners,
-                    .private_owner_ids   = private_owner_ids,
-                    .shared_owners       = shared_owners,
-                    .shared_owner_ids    = shared_owner_ids,
-                    .owner_policies      = owner_policies,
-                    .checkpoint_policies = checkpoint_policies,
-                    .direct_shared_victim =
-                        scenario.replacement == nullptr
-                            ? std::nullopt
-                            : std::optional<PlanningOwnerId>(owner_id_for(
-                                  LogicalOwnerKind::SharedPrefix, scenario.publication_slot)),
-                    .candidate_demand_mask =
-                        committed_demand_mask_for(scenario.assessment.shortlist_key),
-                    .candidate_rebuild_ns =
-                        cost_model_.prefill_ns(scenario.assessment.protected_rebuild_work),
-                    .private_baseline_immediate_ns = price_context_transfer_requirements(
-                        cost_model_, private_baseline.transfer_requirements),
-                    .blocked_runnable_requests = blocked_runnable_requests,
-                    .stable_scenario_ordinal   = scenario.stable_ordinal,
-                    .target_budget             = scenario_budget,
-                };
+                auto input               = policy_input(scenario);
+                input.private_owners     = private_owners;
+                input.private_owner_ids  = private_owner_ids;
+                input.shared_owners      = shared_owners;
+                input.shared_owner_ids   = shared_owner_ids;
+                input.target_budget      = target_budget;
+                input.allow_deficit_seed = allow_deficit_seed;
+                input.search             = &search;
+                input.global_best        = selected ? &selected->plan : nullptr;
+                input.complete           = &scenario.complete;
                 std::optional<typename CapturePlanner::Result> planned =
                     capture_planner_.plan(program, cost_model_, input);
-                if (!planned) { continue; }
-                const bool better =
-                    !selected || planned->net_gain > selected->plan.net_gain ||
-                    (planned->net_gain == selected->plan.net_gain &&
-                     std::tie(planned->stable_scenario_ordinal, planned->stable_target_ordinal) <
-                         std::tie(selected->plan.stable_scenario_ordinal,
-                                  selected->plan.stable_target_ordinal));
-                if (better) {
+                if (!planned) { return; }
+                if (!selected || CapturePlanner::better(*planned, selected->plan)) {
                     selected.emplace(SelectedCapture{
-                        .scenario = std::move(scenario),
-                        .plan     = std::move(*planned),
+                        .scenario       = {},
+                        .scenario_index = static_cast<std::size_t>(&scenario - scenarios.data()),
+                        .plan           = std::move(*planned),
                     });
                 }
+            };
+            // Probe the least disruptive identity of every competitive scenario before any
+            // combinatorial expansion. A full catalog must not spend its whole budget on slot 0.
+            bool construction_offered = false;
+            for (unsigned pass = 0; pass < 2 && !search.stopped; ++pass) {
+                search.stop = CaptureSearchStop::None;
+                for (auto& scenario : scenarios) {
+                    if (scenario.complete || scenario.upper_bound == 0 ||
+                        (selected &&
+                         !CapturePlanner::may_beat(scenario.upper_bound, scenario.stable_ordinal,
+                                                   selected->plan))) {
+                        scenario.complete = true;
+                        continue;
+                    }
+                    if (search.stopped || search.targets_remaining == 0) {
+                        search.stopped = true;
+                        if (search.targets_remaining == 0) {
+                            search.stop = CaptureSearchStop::Targets;
+                        }
+                        break;
+                    }
+                    const bool construct = pass == 0 && !construction_offered;
+                    if (construct) { construction_offered = true; }
+                    evaluate(scenario, pass == 0 ? (construct ? 2U : 1U) : search.targets_remaining,
+                             construct);
+                    if (search.stop == CaptureSearchStop::Economic) { break; }
+                }
             }
+            std::uint64_t unclosed_bound = 0;
+            for (const auto& scenario : scenarios) {
+                if (!scenario.complete &&
+                    (!selected ||
+                     CapturePlanner::may_beat(scenario.upper_bound, scenario.stable_ordinal,
+                                              selected->plan))) {
+                    unclosed_bound = std::max(unclosed_bound, scenario.upper_bound);
+                }
+            }
+            const auto add = [](std::uint64_t& total, std::uint64_t value) {
+                total = value > std::numeric_limits<std::uint64_t>::max() - total
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : total + value;
+            };
+            const bool cancelled = cancellation.requested();
+            if (unclosed_bound != 0 && !cancelled) {
+                saturating_increment(context_stats_.capture_search_budget_stops);
+                const auto best = selected ? selected->plan.net_gain : 0;
+                add(context_stats_.capture_search_regret_ns,
+                    unclosed_bound > best ? unclosed_bound - best : 0);
+            }
+            add(context_stats_.capture_search_targets, search.targets_evaluated);
+            add(context_stats_.capture_search_ns,
+                planning_now_ns<SearchClock>() - capture_allowance.started_ns);
+            // A sealed plan owns its physical executable. Moving the winning assessment once
+            // also keeps any future assessment-owned buffers stable through reservation.
+            if (selected) { selected->scenario = std::move(scenarios[selected->scenario_index]); }
         }
 
+        if (cancellation.requested()) {
+            program.skip_capture(std::move(offer));
+            return ActiveCaptureReserveResult::Skipped;
+        }
         if (!selected) {
             reclaim_private_owners_for_capture(program, private_baseline, reassess_private);
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
@@ -1464,6 +1555,10 @@ public:
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
+        out.capture_search_targets             = context_stats_.capture_search_targets;
+        out.capture_search_ns                  = context_stats_.capture_search_ns;
+        out.capture_search_regret_ns           = context_stats_.capture_search_regret_ns;
+        out.capture_search_budget_stops        = context_stats_.capture_search_budget_stops;
         out.pressure_maximal_fallback_selections =
             context_stats_.pressure_maximal_fallback_selections;
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
