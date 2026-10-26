@@ -1498,8 +1498,9 @@ network serialization run outside the GPU executor and do not delay formation of
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom (`--vram-headroom-mib` changes that margin); omitting the option makes it follow `--max-context`. Capacity
-resolves once at startup.
+and leaves 1 GiB of sizing headroom (`--vram-headroom-mib` changes that margin); omitting the option makes it follow `--max-context`. Explicit physical capacity may exceed the logical context times concurrency to retain
+immutable prefix pages and copy-on-write tails; logical request limits and complete runtime
+memory checks still apply. Automatic sizing is unchanged. Capacity resolves once at startup.
 
 Admission reserves the prompt plus a lease of `--kv-lease-window` output tokens (default 4096),
 which grows at decode-round boundaries as the answer grows (see [Start the server](#start-the-server));

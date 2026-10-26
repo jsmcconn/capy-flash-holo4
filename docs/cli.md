@@ -282,7 +282,10 @@ The artifact describes its model configuration and weight representations;
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
-the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
+the 64-token page size. Explicit physical capacity may exceed `--max-context * --max-concurrency`
+to retain immutable checkpoint pages and copy-on-write tail headroom; the per-request logical context
+limit is unchanged, and the complete runtime allocation must still pass the GPU memory budget.
+`--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
 and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
