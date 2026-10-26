@@ -14,11 +14,19 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// True when NINFER_TP_PEER_PULL=1, read at each call: the two-device collectives' GPU-flag
+// transport is requested (ops::PeerEvents) and a captured copy between two devices must be
+// ops::captured_peer_copy_pair() (memcpy_device_async below).
+bool tp_peer_pull_requested();
+
 // cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream), except that an EAGER copy
 // between two devices goes through cudaMemcpyPeerAsync (T68): without P2P a UVA copy cannot read a
 // VMM allocation (cuMemCreate: the elastic KV / expert pool and the prompt workspace lent from it)
 // of a device other than the stream's (cudaErrorInvalidValue); the peer copy can, staged by the
-// driver. Inside a stream capture the plain UVA copy stays (capture rejects cudaMemcpyPeerAsync).
+// driver. Inside a stream capture the plain UVA copy stays (capture rejects cudaMemcpyPeerAsync),
+// except under tp_peer_pull_requested(): a captured copy between two devices then returns
+// cudaErrorNotSupported and enqueues nothing, so a call site not routed through
+// ops::captured_peer_copy_pair() fails at capture instead of replaying an unflagged peer copy.
 cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes, cudaStream_t stream);
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device

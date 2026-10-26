@@ -153,8 +153,13 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), execution.device.stream));
     const ScopedCurrentDevice scope(rank1.device);
     CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.inputs_ready(0), 0));
-    CUDA_CHECK(::ninfer::memcpy_device_async(peer.accepted_drafts.data, frame.accepted_drafts.data,
-                                             frame.accepted_drafts.bytes(), rank1.stream));
+    if (!ops::captured_peer_copy_pair(
+            {nullptr, frame.accepted_drafts.data}, {nullptr, peer.accepted_drafts.data},
+            {0, frame.accepted_drafts.bytes()}, *execution.tp->execution, events)) {
+        CUDA_CHECK(::ninfer::memcpy_device_async(peer.accepted_drafts.data,
+                                                 frame.accepted_drafts.data,
+                                                 frame.accepted_drafts.bytes(), rank1.stream));
+    }
     ops::speculative_select_accepted_hidden(peer.target_hidden, peer.accepted_drafts,
                                             peer.selected_hidden, rank1.stream);
     ops::scatter(peer.selected_hidden, peer.state_destination_slots, peer_continuation_hidden_store,

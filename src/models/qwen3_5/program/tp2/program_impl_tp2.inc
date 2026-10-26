@@ -605,8 +605,11 @@ void ProgramImpl::project_score_tile_split(const Tensor& hidden, const Tensor& l
     {
         const ScopedCurrentDevice scope(rank1.device);
         CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, peer_events->inputs_ready(0), 0));
-        CUDA_CHECK(::ninfer::memcpy_device_async(peer_hidden.data, hidden.data, hidden.bytes(),
-                                                 rank1.stream));
+        if (!ops::captured_peer_copy_pair({nullptr, hidden.data}, {nullptr, peer_hidden.data},
+                                          {0, hidden.bytes()}, *execution_context, *peer_events)) {
+            CUDA_CHECK(::ninfer::memcpy_device_async(peer_hidden.data, hidden.data, hidden.bytes(),
+                                                     rank1.stream));
+        }
     }
     const execution::LinearParameters& head0 = parameters.text.output_head;
     const execution::LinearParameters& head1 = peer_parameters->text.output_head;

@@ -58,13 +58,19 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 } // namespace
 
+bool tp_peer_pull_requested() {
+    const char* value = std::getenv("NINFER_TP_PEER_PULL");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
 cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes,
                                 cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     if (const cudaError_t e = cudaStreamIsCapturing(stream, &status); e != cudaSuccess) {
         return e;
     }
-    if (bytes > 0 && status == cudaStreamCaptureStatusNone) {
+    const bool captured = status != cudaStreamCaptureStatusNone;
+    if (bytes > 0 && (!captured || tp_peer_pull_requested())) {
         cudaPointerAttributes d{};
         cudaPointerAttributes s{};
         if (cudaPointerGetAttributes(&d, dst) != cudaSuccess ||
@@ -72,6 +78,7 @@ cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes,
             (void)cudaGetLastError(); // not a device pointer CUDA knows: the plain copy reports it
         } else if (d.type == cudaMemoryTypeDevice && s.type == cudaMemoryTypeDevice &&
                    d.device != s.device) {
+            if (captured) { return cudaErrorNotSupported; } // see the header: unflagged peer copy
             return cudaMemcpyPeerAsync(dst, d.device, src, s.device, bytes, stream);
         }
     }
