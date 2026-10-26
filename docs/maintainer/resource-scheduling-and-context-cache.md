@@ -1049,3 +1049,26 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 | public capacity options | `include/ninfer/types.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。
+
+
+Local Host-pressure seed: the deficit cover first selects checkpoint-preserving
+Device relief, then (if any non-lane resource or allocator extent geometry
+still binds) tests cost-ordered prefixes of whole-owner evictions. Previously
+demoted owners remain eligible for replacement by eviction. Protected sources and
+an all-owner target are excluded. Joint native composition proves feasibility;
+owner-local freed-byte sums are not used because they omit aliased references.
+Exponential bracketing and bisection bound physical probes logarithmically in
+the eligible owner count. Every returned prefix has passed the exact proof;
+non-monotone allocator placement could miss a smaller feasible prefix. Probes
+use the remaining admission allowance less one observed root assessment,
+and observed probe duration; stopping
+refinement retains the already-proved upper bound. Only the
+selected cover becomes a canonical target; ordinary exact assessment and sealing
+remain authoritative. Optional search may improve this incumbent without the
+maximal-fallback rescue grant. This is a heuristic cover, not an optimal policy;
+small recent owners can lose to larger stale owners under the existing value order.
+Request-log schema28 adds `started_from_maximal`, `host_seed_found`,
+`deficit_cover_probes`, `deficit_cover_evictions`, `deficit_cover_elapsed_ns`
+and `pre_search_elapsed_ns` to per-request materialization diagnostics.
+`host_seed_found` requires a proved prefix with at least one eviction; it is
+false for a zero-eviction joint proof.
