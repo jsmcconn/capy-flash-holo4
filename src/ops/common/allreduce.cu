@@ -21,6 +21,14 @@
 // cudaMemcpyPeerAsync -- see pull_peer() below for why. The choreography, the streams each call
 // is issued on, and the ordering proof are unchanged by that choice: it is the same transfer
 // expressed through the API that CUDA graph capture accepts.
+//
+// THE DIRECT PEER PULL (NINFER_TP_PEER_PULL=1, PeerPull below) replaces the three phases for the
+// small payloads it serves with vLLM's one-stage reduction kernel on each device (a modified copy
+// below, on the packed arithmetic and end barrier of
+// third_party/vllm/custom_collective_common.cuh and a local publishing start barrier) and a local
+// copy-back. Inside a capture it also replaces phase B's copies of every other call with one
+// paired copy kernel per device on the same flags (captured_peer_copy_pair()); phases A and C and
+// their events stay.
 #include "ninfer/ops/allreduce.h"
 
 #include "ninfer/ops/peer_mailbox.h"
@@ -36,9 +44,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+// vLLM's flag barriers and packed reduction, unchanged (third_party/vllm/README.ninfer.md).
+#include "../../../third_party/vllm/custom_collective_common.cuh"
 
 namespace ninfer::ops {
 namespace {
@@ -60,8 +72,9 @@ std::uint8_t* byte_offset(void* base, std::size_t offset) {
 // `destination` (resident on the device `stream` belongs to), issued on the DESTINATION's stream.
 //
 // Deliberately NOT cudaMemcpyPeerAsync. That entry point is rejected inside a stream capture
-// region with cudaErrorStreamCaptureUnsupported (measured on CUDA 13.1 / driver 580.178.04),
-// which would make the entire tensor-parallel decode program uncapturable
+// region with cudaErrorStreamCaptureUnsupported (measured on CUDA 13.1 / driver 580.178.04 and
+// again on CUDA 13.4 / driver 615.71), which would make the entire tensor-parallel decode program
+// uncapturable
 // and cost the ~40-per-layer host launch overhead that CUDA Graphs exist to remove. Under unified
 // virtual addressing -- which every 64-bit Linux CUDA context has -- a device pointer already
 // names its device, so cudaMemcpyAsync with cudaMemcpyDeviceToDevice expresses exactly the same
@@ -267,9 +280,375 @@ bool enable_peer_access(const ExecutionContext& ec) {
     return true;
 }
 
+// ---- The direct peer pull (NINFER_TP_PEER_PULL=1) ---------------------------------------------
+//
+// Two kernels share one vLLM Signal block per device: the reduction of the small all-reduces
+// (peer_pull_reduce_1stage: rank r's kernel reads buffer[0] and buffer[1], the peer's over P2P,
+// adds them in FP32, rounds once to BF16 into staging[r]; rank r's stream then copies staging[r]
+// into buffer[r]) and the captured paired copy (peer_copy_pair, captured_peer_copy_pair()). Both
+// ranks launch the same grid for a call, so block b pairs with the peer's block b, and per block b:
+//
+//   * start barrier (local, barrier_at_start_publishing): before signalling, the block fences at
+//     system scope and stores the peer's start flag with release semantics; it passes once it has
+//     acquired its own start flag from the peer's block b. Every operand a rank publishes was
+//     completed by its stream before its kernel began, so the peer reads it only after that kernel
+//     boundary, a system fence and a release it acquired -- not on a graph edge alone. (Upstream's
+//     start barrier uses volatile accesses and publishes nothing.)
+//   * the peer's operand is loaded through L2 (ld.global.cg), never from a read-only or L1 line;
+//   * end barrier (upstream's non-final barrier_at_end: release/acquire at system scope, with a
+//     __syncthreads on each side): block b passes once the peer's block b has finished its loop,
+//     whose loads of this rank's memory precede the peer's release. A kernel completes after all
+//     of its blocks passed, so all later work of rank r's stream (the copy-back, the next producer)
+//     overwrites what the peer read only after every peer read of it: the staged path's pull_done
+//     guarantee;
+//   * staging[r] and the copies' destinations on rank r have one writer, rank r's stream.
+//
+// Epochs: a call advances each launched block's counter (Signal::_flag) by two on both ranks. A
+// reduction of n vectors launches min(36, ceil(n / 512)) blocks on both ranks, a paired copy
+// min(36, ceil(u / 512)) for the u 16-byte units of its larger direction, so the counter of every
+// block index stays paired across kinds, sizes, calls and graph replays as long as both ranks run
+// the served calls in one order (PeerEvents). The flags are zeroed once, at creation.
+
+namespace {
+
+// Flag accesses of barrier_at_start_publishing: upstream's st.release.sys / ld.acquire.sys, with a
+// "memory" clobber so the compiler moves no ordinary load or store across them either.
+__device__ __forceinline__ void store_flag_release(vllm::FlagType* flag, vllm::FlagType value) {
+    asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(value), "l"(flag) : "memory");
+}
+
+__device__ __forceinline__ vllm::FlagType load_flag_acquire(vllm::FlagType* flag) {
+    vllm::FlagType value;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(flag) : "memory");
+    return value;
+}
+
+// Modified from vllm::barrier_at_start (third_party/vllm/custom_collective_common.cuh): the same
+// start plane and counter, but the signal is a system-scope fence and a release store and the wait
+// an acquire load, so this rank's completed operand is published to the peer by the barrier.
+template <int ngpus>
+__device__ __forceinline__ void barrier_at_start_publishing(const vllm::RankSignals& sg,
+                                                            vllm::Signal* self_sg, int rank) {
+    const vllm::FlagType flag = self_sg->_flag[blockIdx.x] + 1;
+    if (threadIdx.x < ngpus) {
+        vllm::FlagType* peer_counter = &sg.signals[threadIdx.x]->start[blockIdx.x][rank];
+        vllm::FlagType* self_counter = &self_sg->start[blockIdx.x][threadIdx.x];
+        __threadfence_system();
+        store_flag_release(peer_counter, flag);
+        while (load_flag_acquire(self_counter) != flag) {}
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { self_sg->_flag[blockIdx.x] = flag; }
+}
+
+// One packed operand through L2 (ld.global.cg).
+template <typename P>
+__device__ __forceinline__ P load_packed_cg(const P* address) {
+    static_assert(sizeof(P) == sizeof(uint4), "a packed operand is one 16-byte vector");
+    const uint4 bits = __ldcg(reinterpret_cast<const uint4*>(address));
+    P value;
+    memcpy(&value, &bits, sizeof(P));
+    return value;
+}
+
+// vllm::packed_reduce with its loads through load_packed_cg: the same upcast, the same addition
+// order (rank 0's operand first, on both ranks) and the same downcast.
+template <typename P, int ngpus, typename A>
+__device__ __forceinline__ P packed_reduce_cg(const P* ptrs[], int idx) {
+    A tmp = vllm::upcast(load_packed_cg(ptrs[0] + idx));
+#pragma unroll
+    for (int i = 1; i < ngpus; i++) {
+        vllm::packed_assign_add(tmp, vllm::upcast(load_packed_cg(ptrs[i] + idx)));
+    }
+    return vllm::downcast<P>(tmp);
+}
+
+// Modified from vLLM csrc/custom_all_reduce.cuh, cross_device_reduce_1stage, at commit
+// 6b6a6c5c98e4a23c77bb07d344c515f48c157193 (Apache License 2.0, third_party/vllm/LICENSE).
+// Changed: the ranks' operand pointers arrive by value, not through a device-resident
+// registration table (RankData*); the start barrier publishes (barrier_at_start_publishing); the
+// operands load through L2 (packed_reduce_cg, upstream's arithmetic); the end barrier is
+// upstream's release/acquire one instead of its relaxed final one.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    peer_pull_reduce_1stage(vllm::RankData rank_data, vllm::RankSignals sg, vllm::Signal* self_sg,
+                            T* __restrict__ result, int rank, int size) {
+    using P = typename vllm::packed_t<T>::P;
+    using A = typename vllm::packed_t<T>::A;
+    // note: we don't reorder the address so the accumulation order is the same
+    // for all ranks, ensuring bitwise identical results
+    auto dp = rank_data;
+    barrier_at_start_publishing<ngpus>(sg, self_sg, rank);
+    // do the actual reduction
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+         idx += gridDim.x * blockDim.x) {
+        ((P*)result)[idx] = packed_reduce_cg<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+    }
+    vllm::barrier_at_end<ngpus, false>(sg, self_sg, rank);
+}
+
+// The paired copy: rank r's kernel copies `bytes` from `source` (on the peer) into `destination`
+// (on rank r) between the two barriers; 0 bytes (null operands) still takes part in both. Whole
+// 16-byte vectors when both addresses are 16-byte aligned, then the byte tail; bytes otherwise.
+// Every thread of every block reaches both barriers.
+__global__ void __launch_bounds__(512, 1)
+    peer_copy_pair(vllm::RankSignals sg, vllm::Signal* self_sg, int rank,
+                   const std::uint8_t* __restrict__ source, std::uint8_t* __restrict__ destination,
+                   std::size_t bytes) {
+    barrier_at_start_publishing<2>(sg, self_sg, rank);
+    const std::size_t first   = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride  = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    const bool aligned        = ((reinterpret_cast<std::uintptr_t>(source) |
+                           reinterpret_cast<std::uintptr_t>(destination)) %
+                          16) == 0;
+    const std::size_t vectors = aligned ? bytes / 16 : 0;
+    for (std::size_t i = first; i < vectors; i += stride) {
+        reinterpret_cast<uint4*>(destination)[i] =
+            __ldcg(reinterpret_cast<const uint4*>(source) + i);
+    }
+    for (std::size_t i = vectors * 16 + first; i < bytes; i += stride) {
+        destination[i] = __ldcg(source + i);
+    }
+    vllm::barrier_at_end<2, false>(sg, self_sg, rank);
+}
+
+constexpr int kPeerPullThreads = 512; // upstream's block size; the block limit is upstream's too
+
+} // namespace
+
+class PeerPull {
+public:
+    // Throws without direct P2P in both directions, and, freeing what it allocated, on failure;
+    // the caller restores the current device.
+    static std::unique_ptr<PeerPull> create(const ExecutionContext& ec);
+    ~PeerPull();
+    PeerPull(const PeerPull&)            = delete;
+    PeerPull& operator=(const PeerPull&) = delete;
+
+    [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept {
+        return ec.tp == 2 && ec.dev[0].has_value() && ec.dev[1].has_value() &&
+               ec.dev[0]->device == devices_[0] && ec.dev[1]->device == devices_[1];
+    }
+
+    // One served all-reduce of `bytes` (whole vectors). Leaves the current device changed.
+    void enqueue(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+                 std::size_t bytes, const ExecutionContext& ec);
+
+    // One served paired copy (captured_peer_copy_pair(), operands already validated). Leaves the
+    // current device changed.
+    void enqueue_copy_pair(const std::array<const void*, 2>& source,
+                           const std::array<void*, 2>& destination,
+                           const std::array<std::size_t, 2>& bytes, const ExecutionContext& ec);
+
+private:
+    PeerPull() = default;
+
+    std::array<int, 2> devices_{-1, -1};
+    std::array<vllm::Signal*, 2> signal_{nullptr, nullptr};
+};
+
+std::unique_ptr<PeerPull> PeerPull::create(const ExecutionContext& ec) {
+    // Requested explicitly: without P2P the captured copies would silently stay native.
+    if (!enable_peer_access(ec)) {
+        throw std::runtime_error(
+            "PeerEvents: NINFER_TP_PEER_PULL=1 requires direct P2P in both directions");
+    }
+    std::unique_ptr<PeerPull> pull(new PeerPull());
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r       = static_cast<std::size_t>(rank);
+        pull->devices_[r]  = ec.dev[rank]->device;
+        cudaError_t status = cudaSetDevice(pull->devices_[r]);
+        void* signal       = nullptr;
+        if (status == cudaSuccess) { status = cudaMalloc(&signal, sizeof(vllm::Signal)); }
+        pull->signal_[r] = static_cast<vllm::Signal*>(signal);
+        // The peer's kernels write these flags: they are zero before any served call is issued.
+        if (status == cudaSuccess) { status = cudaMemset(signal, 0, sizeof(vllm::Signal)); }
+        if (status == cudaSuccess) { status = cudaDeviceSynchronize(); }
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("PeerEvents: peer-pull flag setup failed: ") +
+                                     cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+        }
+    }
+    return pull;
+}
+
+PeerPull::~PeerPull() {
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = -1; }
+    // Either rank's kernels write the other's flags: drain both devices before freeing either.
+    for (const int device : devices_) {
+        if (device >= 0 && cudaSetDevice(device) == cudaSuccess) { (void)cudaDeviceSynchronize(); }
+    }
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (signal_[rank] == nullptr || cudaSetDevice(devices_[rank]) != cudaSuccess) { continue; }
+        const cudaError_t status = cudaFree(signal_[rank]);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "CUDA cleanup failed during cudaFree: %s: %s\n",
+                         cudaGetErrorName(status), cudaGetErrorString(status));
+        }
+    }
+    if (previous >= 0) { (void)cudaSetDevice(previous); }
+}
+
+void PeerPull::enqueue(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+                       std::size_t bytes, const ExecutionContext& ec) {
+    const int vectors = static_cast<int>(bytes / 16);
+    const int blocks =
+        std::min(vllm::defaultBlockLimit, (vectors + kPeerPullThreads - 1) / kPeerPullThreads);
+    vllm::RankData operands{};
+    vllm::RankSignals signals{};
+    for (int rank = 0; rank < 2; ++rank) {
+        operands.ptrs[rank]   = buffer[rank].data;
+        signals.signals[rank] = signal_[static_cast<std::size_t>(rank)];
+    }
+    // Both kernels are issued before either copy-back (each kernel waits for its partner).
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        peer_pull_reduce_1stage<nv_bfloat16, 2><<<blocks, kPeerPullThreads, 0, local.stream>>>(
+            operands, signals, signal_[static_cast<std::size_t>(rank)],
+            static_cast<nv_bfloat16*>(staging[rank].data), rank, vectors);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaMemcpyAsync(buffer[rank].data, staging[rank].data, bytes,
+                                   cudaMemcpyDeviceToDevice, local.stream));
+    }
+}
+
+void PeerPull::enqueue_copy_pair(const std::array<const void*, 2>& source,
+                                 const std::array<void*, 2>& destination,
+                                 const std::array<std::size_t, 2>& bytes,
+                                 const ExecutionContext& ec) {
+    const std::size_t units  = (std::max(bytes[0], bytes[1]) + 15) / 16;
+    const std::size_t wanted = (units + kPeerPullThreads - 1) / kPeerPullThreads;
+    // One grid for both ranks, so the blocks' epochs stay paired.
+    const int blocks = static_cast<int>(
+        std::clamp<std::size_t>(wanted, 1, static_cast<std::size_t>(vllm::defaultBlockLimit)));
+    vllm::RankSignals signals{};
+    for (int rank = 0; rank < 2; ++rank) {
+        signals.signals[rank] = signal_[static_cast<std::size_t>(rank)];
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r               = static_cast<std::size_t>(rank);
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        peer_copy_pair<<<blocks, kPeerPullThreads, 0, local.stream>>>(
+            signals, signal_[r], rank, static_cast<const std::uint8_t*>(source[r]),
+            static_cast<std::uint8_t*>(destination[r]), bytes[r]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+namespace {
+
+// Whether `address` is device memory of `device`, as seen from the current device; with
+// `peer_read`, also addressable there at the same address (UVA, peer access enabled).
+bool device_memory_of(const void* address, int device, bool peer_read) {
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, address) != cudaSuccess) {
+        (void)cudaGetLastError(); // not a pointer CUDA knows
+        return false;
+    }
+    return attributes.type == cudaMemoryTypeDevice && attributes.device == device &&
+           (!peer_read || attributes.devicePointer == address);
+}
+
+} // namespace
+
+bool captured_peer_copy_pair(const std::array<const void*, 2>& peer_sources,
+                             const std::array<void*, 2>& local_destinations,
+                             const std::array<std::size_t, 2>& recv_bytes,
+                             const ExecutionContext& ec, const PeerEvents& events) {
+    PeerPull* pull = events.peer_pull();
+    if (pull == nullptr || !pull->serves(ec)) { return false; }
+    const CurrentDeviceGuard guard;
+    cudaStreamCaptureStatus status[2] = {cudaStreamCaptureStatusNone, cudaStreamCaptureStatusNone};
+    unsigned long long capture[2]     = {0, 0};
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaStreamGetCaptureInfo(local.stream, &status[rank], &capture[rank]));
+    }
+    if (status[0] == cudaStreamCaptureStatusNone && status[1] == cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    // Each kernel spins until its partner runs: the pair must be two nodes of one graph.
+    require(status[0] == cudaStreamCaptureStatusActive &&
+                status[1] == cudaStreamCaptureStatusActive && capture[0] == capture[1],
+            "captured_peer_copy_pair: both ranks' streams must capture into one capture");
+    if (recv_bytes[0] == 0 && recv_bytes[1] == 0) { return true; }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        if (recv_bytes[r] == 0) { continue; }
+        const auto* source      = static_cast<const std::uint8_t*>(peer_sources[r]);
+        const auto* destination = static_cast<const std::uint8_t*>(local_destinations[r]);
+        require(source != nullptr && destination != nullptr,
+                "captured_peer_copy_pair: a nonzero direction needs both operands");
+        const std::size_t last = recv_bytes[r] - 1;
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        require(
+            device_memory_of(destination, ec.dev[rank]->device, false) &&
+                device_memory_of(destination + last, ec.dev[rank]->device, false),
+            "captured_peer_copy_pair: local_destinations[r] must be device memory of ec.dev[r]");
+        require(device_memory_of(source, ec.dev[1 - rank]->device, true) &&
+                    device_memory_of(source + last, ec.dev[1 - rank]->device, true),
+                "captured_peer_copy_pair: peer_sources[r] must be peer-addressable device memory "
+                "of the other device");
+    }
+    pull->enqueue_copy_pair(peer_sources, local_destinations, recv_bytes, ec);
+    return true;
+}
+
+namespace {
+
+// DIRECT PEER PULL SELECTION. Returns the PeerPull of `events` when every predicate holds:
+//
+//   * it serves this ExecutionContext's device pair and no StagedScope is open;
+//   * the payload is whole 16-byte vectors, at most kPeerPullMaxBytes, at 16-byte aligned buffer
+//     and staging addresses (the packed reduction's vector contract);
+//   * both ranks' streams are eager, or both capture into the SAME capture: each kernel spins
+//     until its partner runs, so the pair must be launched together.
+//
+// Otherwise the call keeps its route. Leaves the current device changed; the caller holds a
+// CurrentDeviceGuard.
+PeerPull* direct_peer_pull(const std::array<Tensor, 2>& buffer,
+                           const std::array<Tensor, 2>& staging, std::size_t bytes,
+                           const ExecutionContext& ec, const PeerEvents& events) {
+    PeerPull* pull = events.peer_pull();
+    if (pull == nullptr || events.staged_only() || !pull->serves(ec)) { return nullptr; }
+    if ((bytes % 16) != 0 || bytes > kPeerPullMaxBytes) { return nullptr; }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto addresses = reinterpret_cast<std::uintptr_t>(buffer[rank].data) |
+                               reinterpret_cast<std::uintptr_t>(staging[rank].data);
+        if ((addresses % 16) != 0) { return nullptr; }
+    }
+    cudaStreamCaptureStatus status[2] = {cudaStreamCaptureStatusNone, cudaStreamCaptureStatusNone};
+    unsigned long long capture[2]     = {0, 0};
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaStreamGetCaptureInfo(local.stream, &status[rank], &capture[rank]));
+    }
+    if (status[0] == cudaStreamCaptureStatusNone && status[1] == cudaStreamCaptureStatusNone) {
+        return pull;
+    }
+    return status[0] == cudaStreamCaptureStatusActive &&
+                   status[1] == cudaStreamCaptureStatusActive && capture[0] == capture[1]
+               ? pull
+               : nullptr;
+}
+
+} // namespace
+
 PeerEvents::PeerEvents(const ExecutionContext& ec) {
     require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
     const CurrentDeviceGuard guard;
+    // The opt-in peer-pull flags first: when an event creation below fails, this member unwinds
+    // and frees them.
+    if (tp_peer_pull_requested()) { peer_pull_ = PeerPull::create(ec); }
     // Create through a local table so a mid-way failure destroys what was already created instead
     // of leaking it; only a fully constructed set is published into the members.
     cudaEvent_t created[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -307,7 +686,7 @@ PeerEvents::~PeerEvents() {
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
     : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_), mailbox_(other.mailbox_),
       host_exchange_(other.host_exchange_), peer_lanes_(other.peer_lanes_),
-      staged_scopes_(other.staged_scopes_) {
+      staged_scopes_(other.staged_scopes_), peer_pull_(std::move(other.peer_pull_)) {
     other.inputs_ready_  = {nullptr, nullptr};
     other.pull_done_     = {nullptr, nullptr};
     other.mailbox_       = nullptr;
@@ -325,6 +704,7 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     std::swap(host_exchange_, other.host_exchange_);
     std::swap(peer_lanes_, other.peer_lanes_);
     std::swap(staged_scopes_, other.staged_scopes_);
+    peer_pull_.swap(other.peer_pull_);
     return *this;
 }
 
@@ -1084,6 +1464,34 @@ void allreduce_sum_finish(const ExecutionContext& ec, const PeerEvents& events, 
     exchange->sum_finish(lane, ec);
 }
 
+namespace {
+
+// Phase B without a HostExchange: each rank waits for the peer's operand, pulls `bytes` of it from
+// `source[rank]` (on the peer) into `destination[rank]` -- captured with the peer pull's flags as
+// one captured_peer_copy_pair(), otherwise one copy per rank -- and records that it has read.
+void pull_both(const std::array<const void*, 2>& source, const std::array<void*, 2>& destination,
+               std::size_t bytes, const ExecutionContext& ec, const PeerEvents& events) {
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+    }
+    if (!captured_peer_copy_pair(source, destination, {bytes, bytes}, ec, events)) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(pull_peer(destination[rank], source[rank], bytes, local.stream));
+        }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+    }
+}
+
+} // namespace
+
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
     detail::require_allreduce_sum_arguments(buffer, staging, ec, events);
@@ -1105,6 +1513,17 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         return;
     }
 
+    // DIRECT PEER PULL (see direct_peer_pull()), unless an eager HostExchange takes the call: one
+    // reduction kernel per device into its own staging, ordered by the PeerPull flags instead of
+    // the phases below, then a local copy-back.
+    HostExchange* const exchange = eager_host_exchange(ec, events);
+    if (exchange == nullptr) {
+        if (PeerPull* pull = direct_peer_pull(buffer, staging, bytes, ec, events)) {
+            pull->enqueue(buffer, staging, bytes, ec);
+            return;
+        }
+    }
+
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
@@ -1115,7 +1534,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     // Phase B: each rank pulls the peer's operand into storage only it owns. Both inbound copies
     // are issued before either rank waits again, so the two directions overlap. Eagerly with a
     // HostExchange attached the pull goes through its pinned buffers (T56: no host block).
-    if (HostExchange* exchange = eager_host_exchange(ec, events)) {
+    if (exchange != nullptr) {
         exchange->pull({buffer[0].data, buffer[1].data}, {staging[0].data, staging[1].data}, bytes,
                        ec, events);
         for (int rank = 0; rank < 2; ++rank) {
@@ -1124,13 +1543,8 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
             CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
         }
     } else {
-        for (int rank = 0; rank < 2; ++rank) {
-            const DeviceContext& local = *ec.dev[rank];
-            CurrentDeviceGuard::set(local.device);
-            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
-            CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
-            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
-        }
+        pull_both({buffer[1].data, buffer[0].data}, {staging[0].data, staging[1].data}, bytes, ec,
+                  events);
     }
 
     // Phase C: the in-place combine may only overwrite buffer[rank] once the peer has finished
@@ -1213,13 +1627,8 @@ void allreduce_sum_f32(const std::array<Tensor, 2>& partial, const std::array<Te
             CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
         }
     } else {
-        for (int rank = 0; rank < 2; ++rank) {
-            const DeviceContext& local = *ec.dev[rank];
-            CurrentDeviceGuard::set(local.device);
-            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
-            CUDA_CHECK(pull_peer(staging[rank].data, partial[1 - rank].data, bytes, local.stream));
-            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
-        }
+        pull_both({partial[1].data, partial[0].data}, {staging[0].data, staging[1].data}, bytes, ec,
+                  events);
     }
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
@@ -1283,7 +1692,8 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     }
 
     // Phase B: rank r writes its own block locally and pulls the peer's block, both on its own
-    // stream, so destination[r] has exactly one writer.
+    // stream, so destination[r] has exactly one writer. Captured with the peer pull's flags, both
+    // pulls are one captured_peer_copy_pair().
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
@@ -1291,8 +1701,20 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
         CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination[rank].data, offset[rank]),
                                    part[rank].data, block[rank], cudaMemcpyDeviceToDevice,
                                    local.stream));
-        CUDA_CHECK(pull_peer(byte_offset(destination[rank].data, offset[1 - rank]),
-                             part[1 - rank].data, block[1 - rank], local.stream));
+    }
+    const std::array<const void*, 2> peer_block{part[1].data, part[0].data};
+    const std::array<void*, 2> peer_rows{byte_offset(destination[0].data, offset[1]),
+                                         byte_offset(destination[1].data, offset[0])};
+    if (!captured_peer_copy_pair(peer_block, peer_rows, {block[1], block[0]}, ec, events)) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(pull_peer(peer_rows[rank], peer_block[rank], block[1 - rank], local.stream));
+        }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
     }
 

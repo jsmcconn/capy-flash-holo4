@@ -21,12 +21,26 @@
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
 // tensor-parallel decode program uncapturable. See src/ops/common/allreduce.cu's pull_peer().
+// Under NINFER_TP_PEER_PULL=1 (below) a captured transfer is instead one kernel per device,
+// captured_peer_copy_pair(), ordered by GPU flags as well as by the events.
 //
 // CAPTURED MAILBOX. A PeerEvents instance may carry a PeerMailbox (PeerEvents::attach_mailbox,
 // ops/peer_mailbox.h). An allreduce_sum call recorded while BOTH ranks' streams belong to one
 // capture, whose payload is whole aligned 16-byte vectors within one mailbox slot, then becomes
 // one exchange kernel per device that publishes through pinned host memory instead of the staged
 // choreography below; its result is bit-identical. Every other call keeps the staged path.
+//
+// DIRECT PEER PULL. A PeerEvents instance constructed with NINFER_TP_PEER_PULL=1 requires direct
+// P2P in both directions and owns GPU epoch flags (PeerEvents::peer_pull()). An allreduce_sum
+// call that neither the mailbox nor an eager HostExchange takes, whose payload is whole aligned
+// 16-byte vectors of at most kPeerPullMaxBytes, outside a StagedScope, with both ranks' streams
+// eager or in one capture, then becomes one kernel per device that reads both ranks' operands
+// over P2P into its own staging (vLLM's one-stage reduction between start/end flag barriers),
+// then a local copy of the staging back into the buffer; its result is bit-identical. Larger
+// payloads keep their route: at 10 MiB the pull measured slower (graph replay, 570 us vs 474 us
+// staged). Every other CAPTURED cross-device transfer of these collectives (the staged copies,
+// the all-gather's pulls) becomes captured_peer_copy_pair() on the same flags, StagedScope or not;
+// eager transfers keep their copies.
 //
 // ORDERING. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
 // alone owns, on rank r's own stream. Nothing a rank owns is ever written by the peer's stream, so
@@ -88,6 +102,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace ninfer::ops {
@@ -95,6 +110,12 @@ namespace ninfer::ops {
 class PeerMailbox; // see ops/peer_mailbox.h
 class HostExchange;
 class PeerLanes;
+class PeerPull; // the direct peer pull's flags, private to src/ops/common/allreduce.cu
+
+// The largest allreduce_sum payload the direct peer pull carries. Measured in graph replay against
+// the staged path: faster at 10 KiB (7.3 vs 11.7 us) and 60 KiB (10.9 vs 15.8 us), slower at 10
+// MiB.
+inline constexpr std::size_t kPeerPullMaxBytes = 65536;
 
 // Probes cudaDeviceCanAccessPeer in both directions and enables peer access on both devices only
 // when both directions report support; a device that already had peer access enabled is left
@@ -123,6 +144,19 @@ bool enable_peer_access(const ExecutionContext& ec);
 // An instance also names the stream pair's captured transport: null (the staged path for every
 // call) until attach_mailbox() installs a PeerMailbox, which the caller keeps alive for as long as
 // this instance is used and every graph captured through it exists.
+//
+// DIRECT PEER PULL (opt-in). When NINFER_TP_PEER_PULL=1 at construction, enable_peer_access()
+// (called here) must grant direct P2P in both directions: the constructor throws otherwise
+// instead of keeping the native captured copies the variable replaces. The instance then owns
+// one vLLM Signal flag block per device, allocated and zeroed here, freed by the destructor after
+// both devices drained, and transferred by moves. Every call it serves (the small all-reduces and
+// every captured_peer_copy_pair()) advances the flags of its blocks on both ranks, so the n-th
+// served call of rank 0 pairs with the n-th of rank 1: the two ranks must run the served calls in
+// issue order. Eager calls do; a two-device graph launch is ordered on the peer stream on both
+// sides (DecodeGraphPeerBridge::gate_launch and gate_peer_after_launch) or separated from other
+// served calls by a synchronization of both devices. The served operands are read over P2P, so
+// they must be peer-mapped (cudaMalloc) memory, not a VMM allocation mapped for its own device
+// only. Graphs captured through the instance bake in its flags and must not outlive it.
 class PeerEvents {
 public:
     explicit PeerEvents(const ExecutionContext& ec);
@@ -156,11 +190,13 @@ public:
     [[nodiscard]] PeerMailbox* mailbox() const noexcept { return mailbox_; }
 
     // While a StagedScope of this instance is open, captured calls keep the staged path even with
-    // a mailbox attached. A caller opens one around captured collectives that share a round with
-    // cross-device copies: under WSL2 such a copy can stall behind a spinning exchange kernel on
-    // its source device, and the pair then waits on each other until the spin limit (issue #1).
-    // Like mailbox(), usable through a const instance: it only selects the transport of the
-    // calls recorded inside the scope. Scopes nest.
+    // a mailbox attached, and no all-reduce takes the direct peer pull's reduction (whose kernels
+    // spin on GPU flags too, with no limit). A caller opens one around captured collectives that
+    // share a round with cross-device copies: under WSL2 such a copy can stall behind a spinning
+    // exchange kernel on its source device, and the pair then waits on each other until the spin
+    // limit (issue #1). The scope does not affect captured_peer_copy_pair(), which replaces the
+    // cross-device copies themselves. Like mailbox(), usable through a const instance: it only
+    // selects the transport of the calls recorded inside the scope. Scopes nest.
     class StagedScope {
     public:
         explicit StagedScope(const PeerEvents& events) noexcept : events_(&events) {
@@ -195,6 +231,10 @@ public:
 
     [[nodiscard]] PeerLanes* peer_lanes() const noexcept { return peer_lanes_; }
 
+    // The direct peer pull's flags (see above); null when not requested or moved from. Mutable
+    // through a const instance: a served call advances them.
+    [[nodiscard]] PeerPull* peer_pull() const noexcept { return peer_pull_.get(); }
+
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
@@ -202,6 +242,7 @@ private:
     HostExchange* host_exchange_ = nullptr;
     PeerLanes* peer_lanes_       = nullptr;
     mutable int staged_scopes_   = 0;
+    std::unique_ptr<PeerPull> peer_pull_;
 };
 
 /**
@@ -416,6 +457,7 @@ public:
     PeerLanes& operator=(const PeerLanes&) = delete;
 
     [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept;
+
     [[nodiscard]] bool direct() const noexcept { return direct_; }
 
     void sum_begin(int lane, const std::array<Tensor, 2>& buffer,
@@ -462,6 +504,11 @@ HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& event
  * residual_add computation body (FP32 accumulation of the two BF16 operands, one
  * round-to-nearest-even on store). The Op holds no persistent state and allocates nothing.
  *
+ * Transports (see the file comment): the captured mailbox, the eager HostExchange, the direct peer
+ * pull of `events` (its kernel performs the same FP32 addition and one rounding, writes
+ * `staging[r]`, then `staging[r]` is copied into `buffer[r]` on rank r's stream), or the staged
+ * copies (captured with the peer pull's flags: captured_peer_copy_pair()). All give the same bits.
+ *
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
  */
@@ -501,8 +548,9 @@ void allreduce_sum_finish(const ExecutionContext& ec, const PeerEvents& events, 
  * `bf16_out`, when given, holds a contiguous BF16 tensor of the same shape per rank (16-byte
  * aligned), not overlapping the others. Transports as allreduce_sum(): inside a two-device capture
  * with a pipelined PeerMailbox attached and the payload (4 bytes per element) whole 16-byte
- * vectors within one slot, one FP32 exchange kernel per device; otherwise the staged copies and a
- * local FP32 combine. Both transports give identical bits. A mailbox created with the original
+ * vectors within one slot, one FP32 exchange kernel per device; otherwise the staged copies
+ * (captured with the peer pull's flags: captured_peer_copy_pair()) and a local FP32 combine. Both
+ * transports give identical bits. A mailbox created with the original
  * (Legacy) kernel has no FP32 exchange, so such pairs stay staged.
  *
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
@@ -545,8 +593,9 @@ void require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer,
  * the layout so that it is; this Op relocates contiguous storage and performs no transpose.
  *
  * `destination[r]` is written only by rank r's stream: rank r copies its own block locally and
- * pulls the peer's block. The transformation is a pure relocation of storage, so it is verified by
- * exact byte comparison. The Op holds no persistent state and allocates nothing.
+ * pulls the peer's block (captured with the peer pull's flags: one captured_peer_copy_pair() for
+ * both pulls). The transformation is a pure relocation of storage, so it is verified by exact
+ * byte comparison. The Op holds no persistent state and allocates nothing.
  *
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
@@ -557,5 +606,42 @@ void require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer,
  */
 void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
                     const ExecutionContext& ec, const PeerEvents& events);
+
+/**
+ * Captured paired peer copy, exact (no arithmetic). The captured cross-device transfer of the
+ * collectives above and of the model's one-sided pulls when `events` carries the direct peer
+ * pull's flags (NINFER_TP_PEER_PULL=1):
+ *
+ *   local_destinations[r][i] = peer_sources[r][i]   for i < recv_bytes[r], r = 0, 1
+ *
+ * Entry r is what ec.dev[r] RECEIVES: `peer_sources[r]` resides on the other device and is read
+ * over P2P; `local_destinations[r]` resides on ec.dev[r] and is written only by rank r's kernel. A
+ * direction of 0 bytes may pass null operands; its rank still enqueues its kernel, which takes part
+ * in both barriers.
+ *
+ * Served (returns true) when `events` carries the flags for `ec` and both ranks' streams capture
+ * into ONE capture: one kernel per device on ec.dev[r]->stream, both enqueued before the call
+ * returns, on the same grid. Between them the flags guarantee, independently of the graph edges:
+ *
+ *   * publication: rank r reads peer_sources[r] only after the owning rank's kernel started,
+ *     fenced at system scope and released its start flag, which rank r acquired. Everything the
+ *     owning stream completed before the call is therefore visible to the read;
+ *   * read completion: a rank's kernel completes only after it acquired the end flag the peer
+ *     released after its reads of this rank's memory. Work after the call on the owning stream
+ *     therefore overwrites a source only after every peer read of it.
+ *
+ * Both directions 0 bytes: true, nothing enqueued, no flag advanced. Returns false, enqueuing
+ * nothing, without the flags or when both streams are eager: the caller keeps its own copy. Throws
+ * std::invalid_argument, enqueuing nothing, when the flags are present and the two streams do not
+ * capture into one capture, or when a nonzero direction's operands are not device memory of the
+ * right devices (checked at the first and last byte; the source must be addressable from the
+ * receiving device: peer-mapped cudaMalloc memory -- a VMM range mapped for its own device only is
+ * outside the contract and not detected). The two ranks must issue the served calls in one order
+ * (PeerEvents). Preserves the current device; allocates nothing.
+ */
+bool captured_peer_copy_pair(const std::array<const void*, 2>& peer_sources,
+                             const std::array<void*, 2>& local_destinations,
+                             const std::array<std::size_t, 2>& recv_bytes,
+                             const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops
