@@ -1277,6 +1277,10 @@ struct RuntimeStats {
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;
+    std::uint64_t capture_search_targets               = 0;
+    std::uint64_t capture_search_ns                    = 0;
+    std::uint64_t capture_search_regret_ns             = 0;
+    std::uint64_t capture_search_budget_stops          = 0;
     std::uint64_t pressure_maximal_fallback_selections = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
