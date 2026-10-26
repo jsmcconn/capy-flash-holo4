@@ -273,6 +273,27 @@ std::optional<std::size_t> HostKVArena::find_free_extent(std::size_t bytes) cons
     return std::nullopt;
 }
 
+std::uint32_t HostKVArena::first_fit_prefix(std::span<const FreeExtent> extents, std::size_t stride,
+                                            std::uint32_t pages) noexcept {
+    if (stride == 0 || pages == 0 || stride > std::numeric_limits<std::size_t>::max() / pages) {
+        return 0;
+    }
+    const std::size_t bytes = stride * pages;
+    if (std::any_of(extents.begin(), extents.end(),
+                    [&](const FreeExtent& free) { return free.bytes >= bytes; })) {
+        return pages;
+    }
+    const auto extent = std::find_if(extents.begin(), extents.end(),
+                                     [&](const FreeExtent& free) { return free.bytes >= stride; });
+    return extent == extents.end() ? 0U : static_cast<std::uint32_t>(extent->bytes / stride);
+}
+
+std::uint32_t HostKVArena::first_fit_prefix(const HostKVPageLayout& layout,
+                                            std::uint32_t pages) const noexcept {
+    if (!find_layout(layout) || free_descriptors_.empty()) { return 0; }
+    return first_fit_prefix(free_extents_, layout.page_stride, pages);
+}
+
 bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pages) const noexcept {
     if (pages == 0 || free_descriptors_.empty() || !find_layout(layout) ||
         layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
@@ -391,7 +412,9 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
 
 bool HostKVArena::can_allocate_after_suballocation_releases(
     std::span<const HostKVSuballocationRelease> proposed_releases,
-    std::span<const HostKVAllocationRequest> target_allocations) const {
+    std::span<const HostKVAllocationRequest> target_allocations,
+    HostKVAllocationSimulationOptions options) const {
+    if (options.fragment_pages != nullptr) { options.fragment_pages->clear(); }
     if (proposed_releases.empty() && target_allocations.empty()) { return true; }
 
     std::vector<FreeExtent> simulated = free_extents_;
@@ -443,7 +466,7 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     }
 
     std::size_t available_descriptors = free_descriptors_.size();
-    std::size_t required_descriptors  = target_allocations.size();
+    std::size_t required_descriptors  = 0;
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
         bool first                              = true;
@@ -478,22 +501,44 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     }
     if (required_descriptors > available_descriptors) { return false; }
 
-    for (const HostKVAllocationRequest& request : target_allocations) {
-        if (request.layout == nullptr || request.pages == 0) { return false; }
-        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
-        if (!layout_index ||
+    if (!options.fragment_counts.empty() &&
+        options.fragment_counts.size() != target_allocations.size()) {
+        return false;
+    }
+    std::size_t target_descriptors = 0;
+    for (std::size_t index = 0; index < target_allocations.size(); ++index) {
+        const HostKVAllocationRequest& request = target_allocations[index];
+        if (request.layout == nullptr || request.pages == 0 || !find_layout(*request.layout) ||
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
             return false;
         }
-        const std::size_t bytes =
-            request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
-        if (extent == simulated.end()) { return false; }
-        extent->offset += bytes;
-        extent->bytes -= bytes;
-        if (extent->bytes == 0) { simulated.erase(extent); }
+        std::uint32_t remaining = request.pages;
+        std::uint32_t fragments = 0;
+        while (remaining != 0) {
+            const std::uint32_t pages =
+                options.allow_fragmented
+                    ? first_fit_prefix(simulated, request.layout->page_stride, remaining)
+                    : remaining;
+            if (pages == 0) { return false; }
+            const std::size_t bytes = request.layout->page_stride * pages;
+            const auto extent =
+                std::find_if(simulated.begin(), simulated.end(),
+                             [&](const FreeExtent& free) { return free.bytes >= bytes; });
+            if (extent == simulated.end()) { return false; }
+            if (target_descriptors == options.max_target_allocations ||
+                required_descriptors == available_descriptors) {
+                return false;
+            }
+            ++target_descriptors;
+            ++required_descriptors;
+            ++fragments;
+            if (options.fragment_pages != nullptr) { options.fragment_pages->push_back(pages); }
+            extent->offset += bytes;
+            extent->bytes -= bytes;
+            if (extent->bytes == 0) { simulated.erase(extent); }
+            remaining -= pages;
+        }
+        if (!options.fragment_counts.empty()) { options.fragment_counts[index] = fragments; }
     }
     return true;
 }

@@ -416,6 +416,79 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            !subrelease_arena.can_allocate_after_suballocation_releases(
                                subrelease, three_page_target),
                        label + " Host suballocation release feasibility is not extent exact");
+    // Two owners demote 32 and 1 pages with MainKV:BackendKV byte ratio 16:1.
+    // Owner-major first-fit can prove a fit that resource-major execution cannot reserve.
+    ninfer::HostKVArena ordered_arena(host_layout.page_stride * 562,
+                                      std::span<const ninfer::HostKVPageLayout>(layouts));
+    auto first_hole = ordered_arena.allocate(host_layout, 545);
+    auto separator  = ordered_arena.allocate(host_layout, 1);
+    auto last_hole  = ordered_arena.allocate(host_layout, 16);
+    failures += expect(first_hole && separator && last_hole,
+                       label + " ordered Host allocation fixture failed");
+    first_hole->release();
+    last_hole->release();
+    const std::array owner_major{ninfer::HostKVAllocationRequest{&host_layout, 512},
+                                 ninfer::HostKVAllocationRequest{&host_layout, 32},
+                                 ninfer::HostKVAllocationRequest{&host_layout, 16},
+                                 ninfer::HostKVAllocationRequest{&host_layout, 1}};
+    const std::array resource_major{owner_major[0], owner_major[2], owner_major[1], owner_major[3]};
+    failures +=
+        expect(ordered_arena.can_allocate_after_suballocation_releases({}, owner_major) &&
+                   !ordered_arena.can_allocate_after_suballocation_releases({}, resource_major),
+               label + " Host simulation ignored first-fit request order");
+    failures += expect_size(ordered_arena.free_bytes(), host_layout.page_stride * 561,
+                            label + " Host feasibility query changed ownership");
+    auto actual_main_first    = ordered_arena.allocate(host_layout, 512);
+    auto actual_main_second   = ordered_arena.allocate(host_layout, 16);
+    auto actual_backend_first = ordered_arena.allocate(host_layout, 32);
+    failures += expect(actual_main_first && actual_main_second && !actual_backend_first,
+                       label + " resource-major Host simulation disagreed with execution");
+    ninfer::HostKVArena split_arena(host_layout.page_stride * 9, layouts);
+    auto hole3      = split_arena.allocate(host_layout, 3);
+    auto live1      = split_arena.allocate(host_layout, 1);
+    auto hole5      = split_arena.allocate(host_layout, 5);
+    auto* expected3 = split_arena.writable_view(*hole3).data();
+    auto* expected5 = split_arena.writable_view(*hole5).data();
+    hole3.reset();
+    hole5.reset();
+    const std::array split_request{ninfer::HostKVAllocationRequest{&host_layout, 8}};
+    const std::array oversized_request{ninfer::HostKVAllocationRequest{&host_layout, 9}};
+    std::array<std::uint32_t, 1> fragment_counts{};
+    std::vector<std::uint32_t> fragment_pages;
+    failures +=
+        expect(!split_arena.can_allocate_after_suballocation_releases({}, split_request) &&
+                   !split_arena.allocate(host_layout, 8),
+               label + " negative control: contiguous allocation must reject separated 3+5 holes");
+    failures +=
+        expect(split_arena.can_allocate_after_suballocation_releases(
+                   {}, split_request,
+                   {.allow_fragmented = true,
+                    .fragment_counts  = fragment_counts,
+                    .fragment_pages   = &fragment_pages}) &&
+                   fragment_counts[0] == 2 && fragment_pages == std::vector<std::uint32_t>({3, 5}),
+               label + " fragmented proof must select the exact 3+5 extents");
+    failures +=
+        expect(!split_arena.can_allocate_after_suballocation_releases(
+                   {}, split_request, {.allow_fragmented = true, .max_target_allocations = 1}) &&
+                   !split_arena.can_allocate_after_suballocation_releases(
+                       {}, oversized_request, {.allow_fragmented = true}) &&
+                   split_arena.free_bytes() == host_layout.page_stride * 8,
+               label + " fragmented descriptor/capacity query changed ownership");
+    std::vector<ninfer::HostKVAllocation> fragments;
+    for (const auto count : fragment_pages) {
+        failures += expect(
+            split_arena.first_fit_prefix(
+                host_layout, static_cast<std::uint32_t>(8 - (fragments.empty() ? 0 : 3))) == count,
+            label + " actual fragment selector diverged from proof");
+        auto allocation = split_arena.allocate(host_layout, count);
+        failures += expect(allocation && split_arena.writable_view(*allocation).data() ==
+                                             (fragments.empty() ? expected3 : expected5),
+                           label + " actual fragment offset diverged from proof");
+        fragments.push_back(std::move(*allocation));
+    }
+    fragments.clear();
+    failures += expect(split_arena.free_bytes() == host_layout.page_stride * 8,
+                       label + " fragmented cancellation leaked capacity");
     (void)left;
     (void)tail;
     (void)blockers;

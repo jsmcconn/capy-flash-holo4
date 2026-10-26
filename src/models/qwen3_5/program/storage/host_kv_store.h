@@ -23,6 +23,15 @@ struct HostKVPageReplicaRelease {
     LogicalKVPageHandle page;
 };
 
+// Exact joint projection proves that this many inactive address memberships
+// leave in the same transaction. Simulation verifies the complete live count;
+// it never changes ownership or releases an actual replica.
+struct HostKVLastReferenceRelease {
+    LogicalKVPageStore* pages = nullptr;
+    LogicalKVPageHandle page;
+    std::uint32_t address_references = 0;
+};
+
 class HostKVExtentReservation {
 public:
     HostKVExtentReservation() noexcept = default;
@@ -137,6 +146,38 @@ public:
         return reservation;
     }
 
+    // Reserve every fragment before the caller submits any DMA. Local RAII rolls all
+    // reservations back on failure, so no source pin or Host extent can escape.
+    [[nodiscard]] std::optional<std::vector<HostKVExtentReservation>>
+    prepare_fragmented(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+        if (membership.empty() || membership.size() > free_membership_count_) {
+            return std::nullopt;
+        }
+        std::vector<std::uint32_t> indices;
+        indices.reserve(membership.size());
+        for (const auto page : membership) {
+            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            indices.push_back(page.index_);
+        }
+        std::sort(indices.begin(), indices.end());
+        if (std::adjacent_find(indices.begin(), indices.end()) != indices.end()) {
+            return std::nullopt;
+        }
+        const auto& layout = page_layout(pages);
+        std::vector<HostKVExtentReservation> reservations;
+        reservations.reserve(std::min<std::size_t>(membership.size(), free_count_));
+        while (!membership.empty()) {
+            const auto count =
+                arena_->first_fit_prefix(layout, static_cast<std::uint32_t>(membership.size()));
+            if (count == 0) { return std::nullopt; }
+            auto reservation = prepare(pages, membership.first(count));
+            if (!reservation) { return std::nullopt; }
+            reservations.push_back(std::move(*reservation));
+            membership = membership.subspan(count);
+        }
+        return reservations;
+    }
+
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {
         validate(reservation);
         return arena_->writable_view(*extents_[reservation.descriptor_].allocation);
@@ -172,20 +213,26 @@ public:
         return extents_[reservation.descriptor_].page_count;
     }
 
-    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
-        if (!valid(reservation)) { std::terminate(); }
-        Extent& extent     = extents_[reservation.descriptor_];
-        std::uint32_t node = extent.head;
+    [[nodiscard]] bool can_publish(const HostKVExtentReservation& reservation) const noexcept {
+        if (!valid(reservation)) { return false; }
+        const Extent& extent = extents_[reservation.descriptor_];
+        std::uint32_t node   = extent.head;
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
-            if (node == kInvalidIndex) { std::terminate(); }
+            if (node == kInvalidIndex) { return false; }
             const Membership& entry = memberships_[node];
             if (!extent.page_store->can_attach_host_replica(entry.page, entry.epoch,
                                                             entry.coverage)) {
-                std::terminate();
+                return false;
             }
             node = entry.next;
         }
-        if (node != kInvalidIndex) { std::terminate(); }
+        return node == kInvalidIndex;
+    }
+
+    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
+        if (!can_publish(reservation)) { std::terminate(); }
+        Extent& extent = extents_[reservation.descriptor_];
+        std::uint32_t node;
         extent.state = ExtentState::Published;
         const HostKVExtentCapability capability(this, reservation.descriptor_, extent.generation);
         node = extent.head;
@@ -322,11 +369,12 @@ public:
     // unreferenced when a transaction removes their last address-space membership.
     [[nodiscard]] bool can_allocate_after_page_releases(
         std::span<const HostKVPageReplicaRelease> releases,
-        std::span<const HostKVPageReplicaRelease> last_reference_releases,
-        std::span<const HostKVAllocationRequest> allocations) const {
+        std::span<const HostKVLastReferenceRelease> last_reference_releases,
+        std::span<const HostKVAllocationRequest> allocations,
+        HostKVAllocationSimulationOptions options = {}) const {
         begin_release_marks();
         suballocation_scratch_.clear();
-        const auto append = [&](const HostKVPageReplicaRelease& release) {
+        const auto append = [&](const auto& release) {
             if (release.pages == nullptr) { return false; }
             const HostKVPageReplica replica = release.pages->host_replica(release.page);
             const Extent& extent            = require(replica.extent);
@@ -344,14 +392,40 @@ public:
                 return false;
             }
         }
-        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
+        for (const HostKVLastReferenceRelease& release : last_reference_releases) {
+            if (release.pages == nullptr ||
+                !mark_release(*release.pages, release.page, true, release.address_references) ||
                 !append(release)) {
                 return false;
             }
         }
+        std::size_t available_extents = free_count_;
+        std::size_t partition_extents = 0;
+        for (const auto index : affected_extents_) {
+            const Extent& extent      = extents_[index];
+            std::size_t retained_runs = 0;
+            bool retaining            = false;
+            for (auto node = extent.head; node != kInvalidIndex; node = memberships_[node].next) {
+                const bool retained = release_marks_[node] != release_stamp_;
+                if (retained && !retaining) { ++retained_runs; }
+                retaining = retained;
+            }
+            if (retained_runs == 0) {
+                ++available_extents;
+            } else {
+                partition_extents += retained_runs - 1;
+            }
+        }
+        if (partition_extents > available_extents) { return false; }
+        options.max_target_allocations =
+            std::min(options.max_target_allocations, available_extents - partition_extents);
+        std::size_t memberships_available = free_membership_count_ + suballocation_scratch_.size();
+        for (const auto& allocation : allocations) {
+            if (allocation.pages > memberships_available) { return false; }
+            memberships_available -= allocation.pages;
+        }
         return arena_->can_allocate_after_suballocation_releases(suballocation_scratch_,
-                                                                 allocations);
+                                                                 allocations, options);
     }
 
     [[nodiscard]] bool release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) {
@@ -480,10 +554,12 @@ private:
     }
 
     [[nodiscard]] bool mark_release(LogicalKVPageStore& pages, LogicalKVPageHandle page,
-                                    bool last_reference) const noexcept {
+                                    bool last_reference,
+                                    std::uint32_t address_references = 1) const noexcept {
         if (last_reference) {
             if (!pages.valid(page) || !pages.host_resident(page) || pages.source_pins(page) != 0 ||
-                pages.address_references(page) != 1) {
+                pages.writer_references(page) != 0 || address_references == 0 ||
+                pages.address_references(page) != address_references) {
                 return false;
             }
         } else if (!can_release_page_replica(pages, page)) {

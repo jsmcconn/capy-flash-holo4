@@ -220,6 +220,11 @@ struct RequestBasePlanImpl {
 
 // Program-owned physical planning state shared by request materialization and active capture.
 // Request scheduling fields never enter this record, and capture never becomes an admission type.
+struct PressureReplicaExclusions {
+    std::uint32_t page_generation = 0;
+    std::span<const StateImageHandle> state_targets;
+};
+
 struct ResourceCandidateState {
     runtime::RequestPlanSummary summary;
     runtime::IdentityMaterializationAssessment identity_assessment;
@@ -232,6 +237,8 @@ struct ResourceCandidateState {
     // aggregate free bytes are sufficient. Keep the blocked allocation work explicit so a child
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
+    // Exact extra D2H operations introduced by the composed Host fragment boundaries.
+    std::uint32_t pressure_fragment_copy_operations = 0;
     detail::PhysicalDemand demand;
     // Resources released by consuming this private owner alone. Shared aliases are intentionally
     // absent; complete pressure targets settle their joint reference graph separately.
@@ -464,7 +471,7 @@ struct RequestControl {
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
         // Disk tier (v0.7.2): the resume was tried; the frontier it loaded (0: none). The MTP
         // bridge then runs at this frontier instead of `base` (which stays the admitted reuse).
-        bool disk_attempted    = false;
+        bool disk_attempted     = false;
         std::uint32_t disk_base = 0;
     };
 
@@ -635,7 +642,8 @@ public:
     void disk_synchronize() const;
     [[nodiscard]] std::string disk_cache_status() const;
     // At the first step of a root prefill: loads the longest saved checkpoint the prompt begins
-    // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0: none).
+    // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0:
+    // none).
     std::uint32_t disk_cache_resume(SequenceState& sequence, RequestControl& request);
     [[nodiscard]] std::uint32_t disk_resume_tokens(const PreparedPromptData& prompt);
 
@@ -699,12 +707,14 @@ public:
     std::unique_ptr<DiskKVCache> disk_kv;
     std::optional<PinnedHostBuffer> disk_state_scratch;
     std::optional<PinnedHostBuffer> disk_read_buffer;
+
     // Per continuation slot: the slot generation and the frontier last handed to the disk.
     struct DiskSaved {
         std::uint64_t generation = 0;
         std::uint32_t frontier   = 0;
         std::uint64_t digest     = 0; // xxh64 of the tokens up to `frontier`
     };
+
     std::vector<DiskSaved> disk_saved;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
@@ -1000,8 +1010,9 @@ private:
             struct KVChangeWork {
                 std::vector<LogicalKVPageHandle> pages;
                 std::vector<DeviceKVPageHandle> sources;
-                std::optional<HostKVExtentReservation> backup;
-                bool host_released = false;
+                std::vector<HostKVExtentReservation> backups;
+                std::uint32_t fragment_copy_operations = 0;
+                bool host_released                     = false;
             };
 
             qwen3_5::detail::PressureDecision option;
@@ -1292,7 +1303,8 @@ private:
                             const qwen3_5::TargetKVRequirement* retained_requirement    = nullptr,
                             std::span<const runtime::CheckpointRef> dropped_checkpoints = {},
                             std::span<const StateImageHandle> released_states           = {},
-                            const qwen3_5::detail::PressureDecision* current = nullptr) const;
+                            const qwen3_5::detail::PressureDecision* current            = nullptr,
+                            const PressureReplicaExclusions* exclusions = nullptr) const;
     [[nodiscard]] std::vector<qwen3_5::detail::PressureDecision>
     inspect_pressure_successors(const SequenceState& sequence, detail::PhysicalResources residual,
                                 const MaterializationSourceProtection* protection,
@@ -1301,10 +1313,12 @@ private:
         const SharedPrefixState& shared, detail::PhysicalResources residual,
         const MaterializationSourceProtection* protection,
         const qwen3_5::detail::PressureDecision* current = nullptr) const;
-    [[nodiscard]] std::optional<qwen3_5::detail::PressureDecision> inspect_shared_pressure_option(
-        const SharedPrefixState& shared, detail::PhysicalResources deficit,
-        const MaterializationSourceProtection* protection = nullptr,
-        const qwen3_5::detail::PressureDecision* current  = nullptr) const;
+    [[nodiscard]] std::optional<qwen3_5::detail::PressureDecision>
+    inspect_shared_pressure_option(const SharedPrefixState& shared,
+                                   detail::PhysicalResources deficit,
+                                   const MaterializationSourceProtection* protection = nullptr,
+                                   const qwen3_5::detail::PressureDecision* current  = nullptr,
+                                   const PressureReplicaExclusions* exclusions = nullptr) const;
     [[nodiscard]] std::vector<qwen3_5::detail::PressureDecision> inspect_shared_pressure_options(
         const SharedPrefixState& shared, detail::PhysicalResources deficit,
         const MaterializationSourceProtection* protection = nullptr,
@@ -1377,7 +1391,7 @@ private:
         std::span<const qwen3_5::detail::PressureDecision> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
         std::span<const qwen3_5::detail::PressureDecision> shared_pressure_options,
-        std::vector<HostKVPageReplicaRelease>* released_host_pages) const;
+        std::vector<HostKVLastReferenceRelease>* released_host_pages) const;
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);

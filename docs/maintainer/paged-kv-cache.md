@@ -374,6 +374,20 @@ Host replica 使用 logical-order packed `HostKVPageLayout`：
 Host arena 是有界 variable-size allocator。Plan 必须针对完整 release/allocation recipe 验证 extent geometry；
 `free_bytes` 只是占用摘要，不是可分配性的充分证明。
 
+Pressure demotions may span several existing extents. Planning and reservation share the same
+first-fit rule: prefer an extent fitting the whole remainder, otherwise consume a page-aligned
+prefix of the first extent fitting one page. The joint proof follows execution's resource-major
+order (Shared then Private Main KV, then Shared then Private Backend KV), charges both descriptor
+pools and membership capacity after releases, and prices the extra physical copy runs at the exact
+fragment boundaries. Other Host allocations keep their contiguous contract.
+
+Every fragment for a demotion is reserved before DMA starts, and the transaction owns all of them
+before a copy can throw. Failed submissions synchronize transfer streams before releasing source
+pins or Host memory. After copies finish, all fragments pass epoch/coverage preflight before any
+is published; Device replicas are dropped only after publication. Cancellation returns every
+unpublished fragment through the existing reservation lifetime.
+
+
 ### 5.4 Replica transfer
 
 D2H/H2D transfer 复制完整 page payload，可以把相邻 physical IDs 合并成更少的 transfer runs。
@@ -401,8 +415,10 @@ tp 2 时 rank 1 持有自己的 Device page pool 与 execution tables（plane �
 logical page、reservation 或 address-space 簿记；这些只在 rank 0。
 
 - `DeviceKVPagePool::attach_mirror(mirror, where)`：rank 0 pool 的每次 `zero_pages`/`copy_page` 在
-  `where.stream` 上以相同 physical page ID 在 mirror 上重放。Mirror 必须有相同 page 容量；挂接后 Host
-  transfer 被拒绝，因为 Host 层没有 rank 1 副本。
+  `where.stream` 上以相同 physical page ID 在 mirror 上重放。Mirror 必须有相同 page 容量。
+  Host records contain both ranks, rank 0 first and rank 1 at `replica_stride`; the complete
+  two-rank page stays within one extent, including fragmented demotions. Each rank transfers
+  through its own stream, with the existing transfer-order event preserving dependencies.
 - `KVExecutionTablePool::attach_mirror(mirror, where)`：每次 row acquire/release 与 publication 在 mirror 的
   同一行重放。Rank 0 持有 mirror 的 row lease，rank 1 只通过 `mirror_row()` 读取，不自行 `acquire`；
   挂接时两个 pool 都不能有 bound row，mirror 的生命周期必须长于主 pool。
