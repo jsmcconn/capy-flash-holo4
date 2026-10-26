@@ -274,7 +274,8 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     // The selecting rank's drafts (with a selector on rank 1 also their distributions, which rank
     // 0's acceptance reads) reach the other rank through one pull each, ordered after the proposal
     // by a cross-device event, as the collectives' transfers are; nothing writes them again this
-    // round.
+    // round. Captured with the peer pull's flags each pull is a paired copy whose kernel on the
+    // selecting rank receives nothing but publishes the drafts and waits for the read.
     const bool from_peer =
         tp->dflash != nullptr && dflash2_selector_rank(state.execution.parameters) == 1;
     const std::size_t source = from_peer ? 1U : 0U;
@@ -287,6 +288,13 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     const cudaStream_t stream = ec.dev[target]->stream;
     CUDA_CHECK(cudaStreamWaitEvent(stream, events.inputs_ready(static_cast<int>(source)), 0));
     const auto pull = [&](const Tensor& to, const Tensor& from) {
+        std::array<const void*, 2> sources{nullptr, nullptr};
+        std::array<void*, 2> destinations{nullptr, nullptr};
+        std::array<std::size_t, 2> bytes{0, 0};
+        sources[target]      = from.data;
+        destinations[target] = to.data;
+        bytes[target]        = from.bytes();
+        if (ops::captured_peer_copy_pair(sources, destinations, bytes, ec, events)) { return; }
         CUDA_CHECK(::ninfer::memcpy_device_async(to.data, from.data, from.bytes(), stream));
     };
     pull(frames[target]->draft_tokens.slice(1, 0, batch_size),

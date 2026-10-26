@@ -110,10 +110,13 @@ void output_logits_split_rank0(const std::array<Tensor, 2>& hidden,
     // collectives use because it is capturable with and without peer access. Eagerly with a
     // HostExchange attached it goes through pinned host memory instead (T68: rank 1's half may
     // sit in the elastic VMM pool lent to a prompt chunk, which rank 0 cannot address without P2P).
+    // Captured with the peer pull's flags (NINFER_TP_PEER_PULL=1) it is the paired copy: rank 0's
+    // kernel reads, rank 1's receives nothing but publishes its half and waits for the read.
     if (ops::HostExchange* exchange = ops::eager_exchange(execution, events)) {
         exchange->copy(1, partial[1].data, staging.data, bytes1 * height, execution, events);
         CUDA_CHECK(cudaSetDevice(rank0.device));
-    } else {
+    } else if (!ops::captured_peer_copy_pair({partial[1].data, nullptr}, {staging.data, nullptr},
+                                             {bytes1 * height, 0}, execution, events)) {
         CUDA_CHECK(::ninfer::memcpy_device_async(staging.data, partial[1].data, bytes1 * height,
                                                  rank0.stream));
     }

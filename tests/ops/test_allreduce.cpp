@@ -15,6 +15,19 @@
 // Both transports are qualified: the staged path eagerly and inside a two-device CUDA Graph, and
 // the PeerMailbox exchange (both of its kernels) inside a graph replayed several times with fresh
 // inputs; the three captured transports must also agree bit for bit.
+//
+// The direct peer pull (NINFER_TP_PEER_PULL=1, which requires direct P2P) is qualified against
+// an exact oracle -- the definition fl32(a + b) rounded once to BF16, on every BF16 encoding class
+// -- and bit for bit against the staged path, eagerly and captured, at the payloads it serves and
+// the ones it leaves to the other routes, with mixed sizes, replays and ownership moves. Its
+// captured paired copies (captured_peer_copy_pair) are qualified exactly: both directions, one
+// direction, odd, unaligned and large sizes, operands a GPU stage produced just before the copy
+// and overwrites just after it, replays, back-to-back launches and an in-place graph update.
+//
+// Selection: run with NINFER_TP_PEER_PULL=1 in the environment, every case runs on the peer-pull
+// flags (every PeerEvents the suite creates carries them, and Core refuses unflagged captured peer
+// copies); the case labels then end in "[NINFER_TP_PEER_PULL=1]". Without it, the staged default
+// is the control and only the peer-pull cases select the flags.
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/peer_mailbox.h"
 #include "ops/op_tester.h"
@@ -28,10 +41,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -62,10 +78,23 @@ std::vector<double> allreduce_sum_oracle(const std::vector<float>& a, const std:
     return expected;
 }
 
+// The process selection (see the file comment).
+bool peer_pull_selected() {
+    const char* value = std::getenv("NINFER_TP_PEER_PULL");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+// A case label naming the selection the case ran under.
+std::string disclosed(const char* label) {
+    return std::string(label) + (peer_pull_selected() ? " [NINFER_TP_PEER_PULL=1]" : "");
+}
+
 // `ne0` is the contiguous dimension and `ne1` the outer one, so a 1-D buffer passes ne1 == 1 and
 // the real row-parallel residual passes {5120, 48}.
-int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
-                       const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_allreduce_case(const char* case_label, std::int32_t ne0, std::int32_t ne1,
+                       std::uint32_t seed, const ExecutionContext& ec,
+                       const ops::PeerEvents& events) {
+    const std::string label = disclosed(case_label);
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
     std::vector<float> a(count), b(count);
     fill_uniform(a, seed, -8.0f, 8.0f);
@@ -115,9 +144,10 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
 
 // `row_length` is ne[0] (the contiguous row) and the gathered axis is ne[1], so device 0 owns the
 // leading `rows_0` rows and device 1 the trailing `rows_1`.
-int run_allgather_case(const char* label, std::int32_t rows_0, std::int32_t rows_1,
+int run_allgather_case(const char* case_label, std::int32_t rows_0, std::int32_t rows_1,
                        std::int32_t row_length, std::uint32_t seed, const ExecutionContext& ec,
                        const ops::PeerEvents& events) {
+    const std::string label  = disclosed(case_label);
     const std::int32_t rows  = rows_0 + rows_1;
     const std::size_t part_0 = static_cast<std::size_t>(rows_0) * row_length;
     const std::size_t part_1 = static_cast<std::size_t>(rows_1) * row_length;
@@ -201,7 +231,9 @@ int run_allgather_case(const char* label, std::int32_t rows_0, std::int32_t rows
 //
 // Deliberate skew: a large memset is queued on rank 0's stream first, with no host sync, so the
 // two streams run genuinely out of step for the first rounds instead of in lockstep.
-int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_chained_case(const char* case_label, const ExecutionContext& ec,
+                     const ops::PeerEvents& events) {
+    const std::string label          = disclosed(case_label);
     constexpr std::int32_t n         = 5120;
     constexpr int kRounds            = 64;
     constexpr int kStartExponent     = -40;
@@ -258,24 +290,24 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
     int failures = 0;
     set_device(ec, 0);
     failures +=
-        verify_pointwise("chained 64x device 0 buffer", from_device_bf16(buffer_0.data(), count),
+        verify_pointwise(label + " 64x device 0 buffer", from_device_bf16(buffer_0.data(), count),
                          expected, allreduce_sum_bf16_criterion());
-    failures += verify_pointwise("chained 64x device 0 gathered",
+    failures += verify_pointwise(label + " 64x device 0 gathered",
                                  from_device_bf16(gathered_0.data(), 2 * count), expected_gathered,
                                  allreduce_sum_bf16_criterion());
-    failures += buffer_0.verify_guards("chained buffer device 0");
-    failures += staging_0.verify_guards("chained staging device 0");
-    failures += gathered_0.verify_guards("chained gathered device 0");
+    failures += buffer_0.verify_guards(label + " buffer device 0");
+    failures += staging_0.verify_guards(label + " staging device 0");
+    failures += gathered_0.verify_guards(label + " gathered device 0");
     set_device(ec, 1);
     failures +=
-        verify_pointwise("chained 64x device 1 buffer", from_device_bf16(buffer_1.data(), count),
+        verify_pointwise(label + " 64x device 1 buffer", from_device_bf16(buffer_1.data(), count),
                          expected, allreduce_sum_bf16_criterion());
-    failures += verify_pointwise("chained 64x device 1 gathered",
+    failures += verify_pointwise(label + " 64x device 1 gathered",
                                  from_device_bf16(gathered_1.data(), 2 * count), expected_gathered,
                                  allreduce_sum_bf16_criterion());
-    failures += buffer_1.verify_guards("chained buffer device 1");
-    failures += staging_1.verify_guards("chained staging device 1");
-    failures += gathered_1.verify_guards("chained gathered device 1");
+    failures += buffer_1.verify_guards(label + " buffer device 1");
+    failures += staging_1.verify_guards(label + " staging device 1");
+    failures += gathered_1.verify_guards(label + " gathered device 1");
     return failures;
 }
 
@@ -332,8 +364,8 @@ int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events
 
     std::cout << "allreduce microbench: " << bytes << " B bf16 mean " << mean_micros << " us, p50 "
               << samples[samples.size() / 2] << " us, p99 " << samples[(samples.size() * 99) / 100]
-              << " us, max " << samples.back() << " us over " << kTimedIterations
-              << " iterations (eager staged, host-sync dominated)\n";
+              << " us, max " << samples.back() << " us over " << kTimedIterations << " iterations ("
+              << disclosed("eager, host-sync dominated") << ")\n";
 
     int failures = 0;
     set_device(ec, 0);
@@ -382,9 +414,10 @@ void launch_two_devices(const ExecutionContext& ec, DecodeGraphExecutable& execu
 // `mailbox` names the mailbox attached to `events`, or null. The node count proves the selected
 // transport: the mailbox exchange is one kernel node per device per site, the staged path at
 // least two per device per site.
-int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int sites,
+int run_captured_case(const char* case_label, std::int32_t ne0, std::int32_t ne1, int sites,
                       bool expect_mailbox, const ExecutionContext& ec,
                       const ops::PeerEvents& events, const ops::PeerMailbox* mailbox) {
+    const std::string label          = disclosed(case_label);
     constexpr int kReplays           = 4;
     constexpr int kBackToBack        = 3;
     constexpr std::size_t kSkewBytes = 64u << 20;
@@ -541,7 +574,7 @@ void run_captured_microbenchmark(const char* label, const ExecutionContext& ec,
     synchronize_both(ec);
     const std::chrono::duration<double, std::micro> elapsed =
         std::chrono::steady_clock::now() - started;
-    std::cout << "allreduce captured replay (" << label << "): " << bytes << " B bf16, "
+    std::cout << "allreduce captured replay (" << disclosed(label) << "): " << bytes << " B bf16, "
               << elapsed.count() / (static_cast<double>(kReplays) * kSites)
               << " us per all-reduce over " << kReplays << " replays of " << kSites
               << " (informative)\n";
@@ -605,10 +638,10 @@ int run_transport_identity_case(const char* label, std::int32_t ne0, std::int32_
     std::vector<float> a(count), b(count);
     fill_uniform(a, seed, -8.0f, 8.0f);
     fill_uniform(b, seed + 1, -8.0f, 8.0f);
-    const auto a_bits = encode_bf16(a);
-    const auto b_bits = encode_bf16(b);
-    int failures      = 0;
-    const std::string base(label);
+    const auto a_bits      = encode_bf16(a);
+    const auto b_bits      = encode_bf16(b);
+    int failures           = 0;
+    const std::string base = disclosed(label);
     const auto staged_bits =
         captured_bits((base + " staged").c_str(), ne0, ne1, a_bits, b_bits, ec, staged, failures);
     const auto legacy_bits =
@@ -788,6 +821,758 @@ int run_mailbox_hang_case(const ExecutionContext& ec, ops::PeerExchangeKernel ke
     return failures;
 }
 
+// ---- Direct peer pull -------------------------------------------------------------------------
+
+// NINFER_TP_PEER_PULL=1 for the scope's lifetime, then the caller's value again (unset when it
+// was), so the process selection survives.
+class ScopedPeerPullRequest {
+public:
+    ScopedPeerPullRequest() {
+        const char* prior = std::getenv(kVariable);
+        had_prior_        = prior != nullptr;
+        if (had_prior_) { prior_ = prior; }
+        ::setenv(kVariable, "1", 1);
+    }
+
+    ~ScopedPeerPullRequest() {
+        if (had_prior_) {
+            ::setenv(kVariable, prior_.c_str(), 1);
+        } else {
+            ::unsetenv(kVariable);
+        }
+    }
+
+    ScopedPeerPullRequest(const ScopedPeerPullRequest&)            = delete;
+    ScopedPeerPullRequest& operator=(const ScopedPeerPullRequest&) = delete;
+
+private:
+    static constexpr const char* kVariable = "NINFER_TP_PEER_PULL";
+    bool had_prior_                        = false;
+    std::string prior_;
+};
+
+// A PeerEvents with the direct peer pull requested: its constructor reads the variable.
+ops::PeerEvents make_peer_pull_events(const ExecutionContext& ec) {
+    const ScopedPeerPullRequest request;
+    return ops::PeerEvents(ec);
+}
+
+// One launch with the Program's gates (models/qwen3_5/program/graph_execution.h).
+void launch_gated(const ExecutionContext& ec, const DecodeGraphPeerBridge& bridge,
+                  DecodeGraphExecutable& executable) {
+    set_device(ec, 0);
+    bridge.gate_launch(ec.dev[1]->stream, ec.dev[0]->stream);
+    executable.launch(ec.dev[0]->stream);
+    bridge.gate_peer_after_launch(ec.dev[1]->stream, ec.dev[0]->stream);
+}
+
+// Signed zeros, subnormals, infinities, NaNs, the largest finite values (whose sums overflow) and
+// ordinary values: the first 256 elements pair each of these 16 encodings with each other one,
+// the rest are hashed bit patterns over all BF16 encodings.
+std::vector<std::uint16_t> encoding_inputs(std::size_t count, std::uint32_t seed, int rank) {
+    constexpr std::uint16_t kSpecial[16] = {0x0000, 0x8000, 0x0001, 0x8001, 0x7f80, 0xff80,
+                                            0x7fc1, 0x7f81, 0x7fff, 0xffff, 0x7f7f, 0xff7f,
+                                            0x3f80, 0xbf80, 0x3b80, 0xbb80};
+    std::vector<std::uint16_t> bits(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i < 256) {
+            const std::size_t shift = (seed % 16) * (rank != 0 ? 7 : 3) + (rank != 0 ? i / 16 : 0);
+            bits[i]                 = kSpecial[(i + shift) % 16];
+            continue;
+        }
+        std::uint32_t x = static_cast<std::uint32_t>(i) * 1664525u + seed * 1013904223u +
+                          static_cast<std::uint32_t>(rank) * 747796405u;
+        x ^= x >> 16;
+        bits[i] = static_cast<std::uint16_t>(x);
+    }
+    return bits;
+}
+
+// The Op's definition, independently: one FP32 addition of the represented BF16 inputs, rounded
+// once to BF16 (round-to-nearest-even).
+std::uint16_t bf16_sum_oracle(std::uint16_t a, std::uint16_t b) {
+    return f32_to_bf16(bf16_to_f32(a) + bf16_to_f32(b));
+}
+
+bool bf16_is_nan(std::uint16_t bits) { return (bits & 0x7fffu) > 0x7f80u; }
+
+// Exact, except that the definition leaves NaN payloads open: any NaN matches a NaN.
+int verify_bf16_oracle(const std::string& label, const std::vector<std::uint16_t>& got,
+                       const std::vector<std::uint16_t>& expected) {
+    if (got.size() != expected.size()) {
+        std::cerr << label << ": size mismatch\n";
+        return 1;
+    }
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != expected[i] && !(bf16_is_nan(got[i]) && bf16_is_nan(expected[i]))) {
+            std::cerr << label << ": oracle mismatch at index " << i << ": 0x" << std::hex << got[i]
+                      << " expected 0x" << expected[i] << std::dec << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// One all-reduce's guarded buffer and staging on each rank.
+struct AllreducePair {
+    std::size_t count = 0;
+    std::size_t bytes = 0;
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> storage; // buffer, staging of rank 0, 1
+    std::array<Tensor, 2> buffer{};
+    std::array<Tensor, 2> staging{};
+
+    AllreducePair(const ExecutionContext& ec, std::int32_t ne0, std::int32_t ne1)
+        : count(static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1)),
+          bytes(count * sizeof(std::uint16_t)) {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            storage.push_back(std::make_unique<GuardedDeviceBuffer>(bytes));
+            storage.push_back(std::make_unique<GuardedDeviceBuffer>(bytes));
+            storage.back()->fill(0);
+            buffer[rank]  = Tensor(storage[2 * rank]->data(), DType::BF16, {ne0, ne1});
+            staging[rank] = Tensor(storage[2 * rank + 1]->data(), DType::BF16, {ne0, ne1});
+        }
+    }
+
+    void upload(const ExecutionContext& ec, const std::array<std::vector<std::uint16_t>, 2>& bits) {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            storage[2 * rank]->copy_from_host(bits[rank].data(), bytes);
+        }
+    }
+
+    // Rank 0's result, after checking that rank 1 holds the same bits and no guard was hit.
+    std::vector<std::uint16_t> agreed(const ExecutionContext& ec, const std::string& label,
+                                      int& failures) const {
+        set_device(ec, 0);
+        auto bits = from_device<std::uint16_t>(storage[0]->data(), count);
+        set_device(ec, 1);
+        failures += verify_exact((label + " device 1 equals device 0").c_str(),
+                                 from_device<std::uint16_t>(storage[2]->data(), count), bits);
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            failures += storage[2 * rank]->verify_guards(label + " buffer");
+            failures += storage[2 * rank + 1]->verify_guards(label + " staging");
+        }
+        return bits;
+    }
+};
+
+// The peer pull against the staged path and the oracle, eagerly and in a two-device graph. A
+// payload it does not serve runs the other routes through the same events: the same bits.
+int run_peer_pull_identity_case(const char* case_label, std::int32_t ne0, std::int32_t ne1,
+                                std::uint32_t seed, const ExecutionContext& ec,
+                                const ops::PeerEvents& staged, const ops::PeerEvents& pull) {
+    const std::string label = disclosed(case_label);
+    const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
+    const std::array<std::vector<std::uint16_t>, 2> inputs{encoding_inputs(count, seed, 0),
+                                                           encoding_inputs(count, seed, 1)};
+    std::vector<std::uint16_t> expected(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        expected[i] = bf16_sum_oracle(inputs[0][i], inputs[1][i]);
+    }
+    const std::array<const ops::PeerEvents*, 2> transports{&staged, &pull};
+    int failures = 0;
+    for (const bool captured : {false, true}) {
+        const std::string mode = std::string(label) + (captured ? " captured" : " eager");
+        std::array<std::vector<std::uint16_t>, 2> bits;
+        for (std::size_t t = 0; t < 2; ++t) {
+            AllreducePair pair(ec, ne0, ne1);
+            pair.upload(ec, inputs);
+            retire_staging(ec);
+            const auto call = [&] {
+                ops::allreduce_sum(pair.buffer, pair.staging, ec, *transports[t]);
+            };
+            if (captured) {
+                const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
+                DecodeGraphDefinition definition;
+                capture_two_devices(ec, bridge, definition, call);
+                DecodeGraphExecutable executable;
+                executable.instantiate(definition);
+                launch_two_devices(ec, executable);
+            } else {
+                call();
+                synchronize_both(ec);
+            }
+            bits[t] = pair.agreed(ec, mode + (t == 0 ? " staged" : " peer pull"), failures);
+        }
+        failures += verify_exact((mode + " peer pull equals staged").c_str(), bits[1], bits[0]);
+        failures += verify_bf16_oracle(mode + " peer pull oracle", bits[1], expected);
+    }
+    return failures;
+}
+
+// A decode round's mix on one PeerEvents: one graph of [5120] (two blocks of the peer pull),
+// [5120, 6] (eight blocks), [5120, 16] (160 KiB: staged; with the flags, paired copies of twenty
+// blocks) and [5120] again, launched with the
+// Program's gates (models/qwen3_5/program/graph_execution.h), then two eager all-reduces and a
+// second gated launch, with no host synchronization in between. A captured memset holds rank 1
+// back and an eager one rank 0, so the ranks reach the exchanges out of step, and each block's
+// epoch counter advances differently per size: a mispaired epoch combines the wrong operands.
+// Fresh inputs of every encoding class each round. After a buffer's first site both ranks hold s,
+// so each later site of that buffer yields oracle(s, s).
+int run_peer_pull_mixed_case(const char* case_label, const ExecutionContext& ec,
+                             const ops::PeerEvents& events) {
+    const std::string label          = disclosed(case_label);
+    constexpr int kRounds            = 3;
+    constexpr std::size_t kSkewBytes = 64u << 20;
+    AllreducePair small(ec, 5120, 1), medium(ec, 5120, 6), large(ec, 5120, 16);
+    const std::array<AllreducePair*, 3> pairs{&small, &medium, &large};
+    const std::array<const char*, 3> names{" [5120]", " [5120,6]", " [5120,16]"};
+    const std::array<int, 3> sites{5, 3, 2}; // per round: graph, eager, graph
+    set_device(ec, 0);
+    DeviceBuffer skew_0(kSkewBytes);
+    set_device(ec, 1);
+    DeviceBuffer skew_1(kSkewBytes);
+    retire_staging(ec);
+
+    const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
+    DecodeGraphDefinition definition;
+    capture_two_devices(ec, bridge, definition, [&] {
+        set_device(ec, 1);
+        cuda_check(cudaMemsetAsync(skew_1.p, 0, skew_1.bytes, ec.dev[1]->stream), "skew memset");
+        ops::allreduce_sum(small.buffer, small.staging, ec, events);
+        ops::allreduce_sum(medium.buffer, medium.staging, ec, events);
+        ops::allreduce_sum(large.buffer, large.staging, ec, events);
+        ops::allreduce_sum(small.buffer, small.staging, ec, events);
+    });
+    DecodeGraphExecutable executable;
+    executable.instantiate(definition);
+    const auto gated_launch = [&] {
+        set_device(ec, 0);
+        bridge.gate_launch(ec.dev[1]->stream, ec.dev[0]->stream);
+        executable.launch(ec.dev[0]->stream);
+        bridge.gate_peer_after_launch(ec.dev[1]->stream, ec.dev[0]->stream);
+    };
+
+    int failures = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        std::array<std::array<std::vector<std::uint16_t>, 2>, 3> inputs;
+        for (std::size_t p = 0; p < 3; ++p) {
+            const auto seed =
+                701u + 16u * static_cast<std::uint32_t>(round) + 2u * static_cast<std::uint32_t>(p);
+            inputs[p] = {encoding_inputs(pairs[p]->count, seed, 0),
+                         encoding_inputs(pairs[p]->count, seed, 1)};
+            pairs[p]->upload(ec, inputs[p]);
+        }
+        retire_staging(ec);
+        gated_launch();
+        set_device(ec, 0);
+        cuda_check(cudaMemsetAsync(skew_0.p, round & 0xff, skew_0.bytes, ec.dev[0]->stream),
+                   "skew memset");
+        ops::allreduce_sum(small.buffer, small.staging, ec, events);
+        ops::allreduce_sum(medium.buffer, medium.staging, ec, events);
+        gated_launch();
+        synchronize_both(ec);
+
+        for (std::size_t p = 0; p < 3; ++p) {
+            std::vector<std::uint16_t> expected(pairs[p]->count);
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                std::uint16_t value = bf16_sum_oracle(inputs[p][0][i], inputs[p][1][i]);
+                for (int site = 1; site < sites[p]; ++site) {
+                    value = bf16_sum_oracle(value, value);
+                }
+                expected[i] = value;
+            }
+            const std::string name =
+                std::string(label) + " round " + std::to_string(round) + names[p];
+            const auto bits = pairs[p]->agreed(ec, name, failures);
+            failures += verify_bf16_oracle(name + " oracle", bits, expected);
+        }
+    }
+    return failures;
+}
+
+// Ownership of the peer-pull flags. A peer-pull PeerEvents move-assigned over another (which then
+// frees the other's flags) and move-constructed again keeps serving with its epochs; the
+// moved-from instance is dead; construction and destruction leave the current device as found.
+int run_peer_pull_ownership_case(const ExecutionContext& ec, bool peer_access,
+                                 const ops::PeerEvents& staged) {
+    const auto current_device = [] {
+        int device = -1;
+        cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+        return device;
+    };
+    int failures = 0;
+    set_device(ec, 1);
+    const int caller           = current_device();
+    ops::PeerEvents keeper     = make_peer_pull_events(ec);
+    const ops::PeerPull* flags = nullptr;
+    {
+        ops::PeerEvents donor = make_peer_pull_events(ec);
+        flags                 = donor.peer_pull();
+        keeper                = std::move(donor);
+    }
+    if (current_device() != caller) {
+        std::cerr
+            << "peer pull ownership: construction or destruction changed the current device\n";
+        ++failures;
+    }
+    if ((flags != nullptr) != peer_access) {
+        std::cerr << "peer pull ownership: flags " << (flags != nullptr ? "exist" : "are missing")
+                  << " although direct P2P is " << (peer_access ? "enabled" : "unavailable")
+                  << '\n';
+        ++failures;
+    }
+    ops::PeerEvents moved(std::move(keeper));
+    if (moved.peer_pull() != flags || keeper.peer_pull() != nullptr || keeper.live()) {
+        std::cerr << "peer pull ownership: a move did not transfer the flags\n";
+        ++failures;
+    }
+    failures +=
+        run_peer_pull_identity_case("moved peer pull [5120]", 5120, 1, 801u, ec, staged, moved);
+    failures +=
+        run_peer_pull_identity_case("moved peer pull [5120,6]", 5120, 6, 803u, ec, staged, moved);
+    return failures;
+}
+
+// Requested without direct P2P in both directions, the peer pull must refuse construction rather
+// than keep native captured peer copies.
+int run_peer_pull_requires_p2p_case(const ExecutionContext& ec) {
+    try {
+        const ops::PeerEvents events = make_peer_pull_events(ec);
+    } catch (const std::runtime_error&) {
+        std::cout << "peer pull: refused without direct P2P\n";
+        return 0;
+    }
+    std::cerr << "peer pull: requested without direct P2P, construction succeeded\n";
+    return 1;
+}
+
+std::vector<std::uint8_t> pattern_bytes(std::size_t count, std::uint32_t seed) {
+    std::vector<std::uint8_t> bits(count);
+    std::uint32_t x = seed * 2654435761u + 1u;
+    for (std::uint8_t& bit : bits) {
+        x   = x * 1664525u + 1013904223u;
+        bit = static_cast<std::uint8_t>(x >> 24);
+    }
+    return bits;
+}
+
+// One captured paired copy's operands: rank r receives bytes[r] from source[1 - r] (on the peer)
+// into destination[r], every operand `offset` bytes into its guarded buffer; a direction of 0
+// bytes passes null operands.
+struct PeerCopyOperands {
+    std::array<std::size_t, 2> bytes{};
+    std::size_t offset = 0;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> source;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> destination;
+    std::array<std::vector<std::uint8_t>, 2> sent; // what source[r] holds
+    std::array<const void*, 2> from{nullptr, nullptr};
+    std::array<void*, 2> to{nullptr, nullptr};
+
+    PeerCopyOperands(const ExecutionContext& ec, std::array<std::size_t, 2> received,
+                     std::size_t shift)
+        : bytes(received), offset(shift) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            set_device(ec, rank);
+            source[r]      = std::make_unique<GuardedDeviceBuffer>(bytes[1 - r] + offset);
+            destination[r] = std::make_unique<GuardedDeviceBuffer>(bytes[r] + offset);
+        }
+        for (std::size_t r = 0; r < 2; ++r) {
+            if (bytes[r] == 0) { continue; }
+            from[r] = static_cast<const std::uint8_t*>(source[1 - r]->data()) + offset;
+            to[r]   = static_cast<std::uint8_t*>(destination[r]->data()) + offset;
+        }
+    }
+
+    // Fresh source bytes, destinations filled with 0xcd, both devices retired.
+    void upload(const ExecutionContext& ec, std::uint32_t seed) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            set_device(ec, rank);
+            sent[r] = pattern_bytes(bytes[1 - r], seed + static_cast<std::uint32_t>(rank));
+            source[r]->copy_from_host(sent[r].data(), sent[r].size(), offset);
+            destination[r]->fill(0xcd);
+        }
+        retire_staging(ec);
+    }
+
+    // Exact: each destination holds the peer's bytes (its leading `offset` bytes untouched), each
+    // source is unchanged, every guard intact.
+    int verify(const ExecutionContext& ec, const std::string& label) const {
+        int failures = 0;
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r           = static_cast<std::size_t>(rank);
+            const std::string name = label + " device " + std::to_string(rank);
+            set_device(ec, rank);
+            std::vector<std::uint8_t> received(bytes[r] + offset);
+            destination[r]->copy_to_host(received.data(), received.size());
+            std::vector<std::uint8_t> expected(offset, 0xcd);
+            expected.insert(expected.end(), sent[1 - r].begin(), sent[1 - r].end());
+            failures += verify_exact((name + " received").c_str(), received, expected);
+            std::vector<std::uint8_t> kept(sent[r].size());
+            source[r]->copy_to_host(kept.data(), kept.size(), offset);
+            failures += verify_exact((name + " source unchanged").c_str(), kept, sent[r]);
+            failures += destination[r]->verify_guards(name + " destination");
+            failures += source[r]->verify_guards(name + " source");
+        }
+        return failures;
+    }
+};
+
+// Captured paired copies, exact. One graph -- a captured memset holding rank 1 back, then the pair
+// -- must hold the memset and one kernel per device (no memcpy node), and is launched through the
+// Program's gates kReplays times with fresh bytes, then kBackToBack times with no host step.
+int run_peer_copy_pair_case(const char* case_label, std::size_t bytes0, std::size_t bytes1,
+                            std::size_t offset, const ExecutionContext& ec,
+                            const ops::PeerEvents& events) {
+    constexpr int kReplays           = 4;
+    constexpr int kBackToBack        = 3;
+    constexpr std::size_t kSkewBytes = 64u << 20;
+    const std::string label          = disclosed(case_label);
+    PeerCopyOperands copy(ec, {bytes0, bytes1}, offset);
+    set_device(ec, 1);
+    DeviceBuffer skew(kSkewBytes);
+    retire_staging(ec);
+
+    const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
+    DecodeGraphDefinition definition;
+    bool served = false;
+    capture_two_devices(ec, bridge, definition, [&] {
+        set_device(ec, 1);
+        cuda_check(cudaMemsetAsync(skew.p, 0, skew.bytes, ec.dev[1]->stream), "skew memset");
+        served = ops::captured_peer_copy_pair(copy.from, copy.to, copy.bytes, ec, events);
+    });
+    int failures = 0;
+    if (!served || definition.node_count() != 3) {
+        std::cerr << label << ": the paired copy did not take the capture ("
+                  << definition.node_count() << " graph nodes)\n";
+        ++failures;
+    }
+    DecodeGraphExecutable executable;
+    executable.instantiate(definition);
+    for (int replay = 0; replay < kReplays; ++replay) {
+        copy.upload(ec, 1101u + 4u * static_cast<std::uint32_t>(replay));
+        launch_gated(ec, bridge, executable);
+        synchronize_both(ec);
+        failures += copy.verify(ec, label + " replay " + std::to_string(replay));
+    }
+    copy.upload(ec, 1131u);
+    for (int launch = 0; launch < kBackToBack; ++launch) { launch_gated(ec, bridge, executable); }
+    synchronize_both(ec);
+    failures += copy.verify(ec, label + " back-to-back launches");
+    return failures;
+}
+
+// In-place update, as the Program moves one profile's executable to another's: a graph of one
+// paired copy is instantiated and launched, then replaced through DecodeGraphExecutable::update by
+// a graph of the same shape over other buffers and sizes (another block count); the updated
+// executable's copies must be exact, launched twice.
+int run_peer_copy_update_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
+    const std::string label = disclosed("paired copy graph update");
+    PeerCopyOperands first(ec, {10240, 10240}, 0);
+    PeerCopyOperands second(ec, {1489920, 30722}, 0);
+    retire_staging(ec);
+    const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
+    int failures       = 0;
+    const auto capture = [&](PeerCopyOperands& copy, DecodeGraphDefinition& definition) {
+        bool served = false;
+        capture_two_devices(ec, bridge, definition, [&] {
+            served = ops::captured_peer_copy_pair(copy.from, copy.to, copy.bytes, ec, events);
+        });
+        if (!served || definition.node_count() != 2) {
+            std::cerr << label << ": the paired copy did not take the capture ("
+                      << definition.node_count() << " graph nodes)\n";
+            ++failures;
+        }
+    };
+    DecodeGraphDefinition first_definition;
+    DecodeGraphDefinition second_definition;
+    capture(first, first_definition);
+    capture(second, second_definition);
+    DecodeGraphExecutable executable;
+    executable.instantiate(first_definition);
+    first.upload(ec, 1201u);
+    launch_gated(ec, bridge, executable);
+    synchronize_both(ec);
+    failures += first.verify(ec, label + " before");
+    executable.update(second_definition);
+    for (int launch = 0; launch < 2; ++launch) {
+        second.upload(ec, 1211u + 4u * static_cast<std::uint32_t>(launch));
+        launch_gated(ec, bridge, executable);
+        synchronize_both(ec);
+        failures += second.verify(ec, label + " after, launch " + std::to_string(launch));
+    }
+    return failures;
+}
+
+// Source publication and read completion behind a GPU producer. One graph of kStages stages, each
+// an all-reduce that rewrites both ranks' buffer (at [5120] the peer pull's reduction kernel and
+// copy-back; at [5121] the staged combine kernel after a paired copy) immediately followed by a
+// paired copy of each rank's buffer into a snapshot of the stage on the peer, and a one-sided copy
+// of rank 1's buffer to rank 0; then a captured all-gather of the two buffers. A captured memset
+// holds rank 1 back. After stage k both ranks hold s_k = oracle(s_(k-1), s_(k-1)), s_0 =
+// oracle(a, b): a copy that read its source before the producer finished delivers s_(k-1), one
+// whose source the next stage overwrote before the read finished delivers s_(k+1). Fresh inputs
+// per replay through the Program's gates, then back-to-back launches.
+int run_peer_copy_publication_case(const char* case_label, std::int32_t n,
+                                   const ExecutionContext& ec, const ops::PeerEvents& events) {
+    constexpr int kStages            = 5;
+    constexpr int kReplays           = 4;
+    constexpr int kBackToBack        = 2;
+    constexpr std::size_t kSkewBytes = 64u << 20;
+    const std::string label          = disclosed(case_label);
+    const auto count                 = static_cast<std::size_t>(n);
+    const std::size_t bytes          = count * sizeof(std::uint16_t);
+
+    AllreducePair pair(ec, n, 1);
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> owned;
+    const auto allocate = [&](int rank, std::size_t size) {
+        set_device(ec, rank);
+        owned.push_back(std::make_unique<GuardedDeviceBuffer>(size));
+        owned.back()->fill(0);
+        return owned.back()->data();
+    };
+    std::array<std::array<void*, kStages>, 2> snapshot{}; // on rank r: the peer's s_k
+    std::array<void*, kStages> one_sided{};               // on rank 0: rank 1's s_k
+    for (int k = 0; k < kStages; ++k) {
+        for (int rank = 0; rank < 2; ++rank) { snapshot[rank][k] = allocate(rank, bytes); }
+        one_sided[k] = allocate(0, bytes);
+    }
+    std::array<Tensor, 2> gathered{};
+    std::array<Tensor, 2> part{};
+    for (int rank = 0; rank < 2; ++rank) {
+        gathered[rank] = Tensor(allocate(rank, 2 * bytes), DType::BF16, {n, 2});
+        part[rank]     = Tensor(pair.buffer[rank].data, DType::BF16, {n, 1});
+    }
+    set_device(ec, 1);
+    DeviceBuffer skew(kSkewBytes);
+    retire_staging(ec);
+
+    const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
+    DecodeGraphDefinition definition;
+    bool served = true;
+    capture_two_devices(ec, bridge, definition, [&] {
+        set_device(ec, 1);
+        cuda_check(cudaMemsetAsync(skew.p, 0, skew.bytes, ec.dev[1]->stream), "skew memset");
+        for (int k = 0; k < kStages; ++k) {
+            ops::allreduce_sum(pair.buffer, pair.staging, ec, events);
+            served = ops::captured_peer_copy_pair({pair.buffer[1].data, pair.buffer[0].data},
+                                                  {snapshot[0][k], snapshot[1][k]}, {bytes, bytes},
+                                                  ec, events) &&
+                     served;
+            served =
+                ops::captured_peer_copy_pair({pair.buffer[1].data, nullptr},
+                                             {one_sided[k], nullptr}, {bytes, 0}, ec, events) &&
+                served;
+        }
+        ops::allgather_rows(gathered, part, ec, events);
+    });
+    int failures = 0;
+    if (!served) {
+        std::cerr << label << ": a paired copy did not take the capture\n";
+        ++failures;
+    }
+    DecodeGraphExecutable executable;
+    executable.instantiate(definition);
+
+    // The stage values of one launch whose ranks start from (a, b).
+    const auto stages_of = [&](const std::vector<std::uint16_t>& a,
+                               const std::vector<std::uint16_t>& b) {
+        std::vector<std::vector<std::uint16_t>> s(kStages, std::vector<std::uint16_t>(count));
+        for (std::size_t i = 0; i < count; ++i) { s[0][i] = bf16_sum_oracle(a[i], b[i]); }
+        for (int k = 1; k < kStages; ++k) {
+            for (std::size_t i = 0; i < count; ++i) {
+                s[k][i] = bf16_sum_oracle(s[k - 1][i], s[k - 1][i]);
+            }
+        }
+        return s;
+    };
+    const auto verify_launch = [&](const std::string& name,
+                                   const std::vector<std::vector<std::uint16_t>>& s) {
+        for (int k = 0; k < kStages; ++k) {
+            const std::string stage = name + " stage " + std::to_string(k);
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                failures +=
+                    verify_exact((stage + " device " + std::to_string(rank) + " snapshot").c_str(),
+                                 from_device<std::uint16_t>(snapshot[rank][k], count), s[k]);
+            }
+            set_device(ec, 0);
+            failures += verify_exact((stage + " one-sided").c_str(),
+                                     from_device<std::uint16_t>(one_sided[k], count), s[k]);
+        }
+        const auto buffer = pair.agreed(ec, name, failures);
+        failures += verify_exact((name + " buffer").c_str(), buffer, s.back());
+        std::vector<std::uint16_t> image(s.back());
+        image.insert(image.end(), s.back().begin(), s.back().end());
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            failures +=
+                verify_exact((name + " gathered device " + std::to_string(rank)).c_str(),
+                             from_device<std::uint16_t>(gathered[rank].data, 2 * count), image);
+        }
+    };
+
+    std::vector<std::uint16_t> last;
+    for (int replay = 0; replay < kReplays; ++replay) {
+        std::array<std::vector<std::uint16_t>, 2> inputs;
+        for (int rank = 0; rank < 2; ++rank) {
+            std::vector<float> values(count);
+            fill_uniform(values,
+                         1301u + 2u * static_cast<std::uint32_t>(replay) +
+                             static_cast<std::uint32_t>(rank),
+                         -8.0f, 8.0f);
+            inputs[static_cast<std::size_t>(rank)] = encode_bf16(values);
+        }
+        pair.upload(ec, inputs);
+        retire_staging(ec);
+        launch_gated(ec, bridge, executable);
+        synchronize_both(ec);
+        const auto s = stages_of(inputs[0], inputs[1]);
+        verify_launch(label + " replay " + std::to_string(replay), s);
+        last = s.back();
+    }
+    std::vector<std::vector<std::uint16_t>> s;
+    for (int launch = 0; launch < kBackToBack; ++launch) {
+        launch_gated(ec, bridge, executable);
+        s    = stages_of(last, last);
+        last = s.back();
+    }
+    synchronize_both(ec);
+    verify_launch(label + " back-to-back launches", s);
+    for (const auto& buffer : owned) { failures += buffer->verify_guards(label + " snapshot"); }
+    return failures;
+}
+
+// Core's guard under NINFER_TP_PEER_PULL=1: inside a capture, a copy between two devices through
+// memcpy_device_async enqueues nothing and reports cudaErrorNotSupported; a local copy is
+// captured as before.
+int run_core_capture_guard_case(const ExecutionContext& ec) {
+    constexpr std::size_t kBytes = 4096;
+    set_device(ec, 1);
+    GuardedDeviceBuffer remote(kBytes);
+    remote.fill(0x11);
+    set_device(ec, 0);
+    GuardedDeviceBuffer local(kBytes), copied(kBytes);
+    local.fill(0x22);
+    copied.fill(0);
+    retire_staging(ec);
+    cudaError_t foreign = cudaSuccess;
+    cudaError_t own     = cudaErrorUnknown;
+    int failures        = 0;
+    {
+        const ScopedPeerPullRequest request;
+        DecodeGraphDefinition definition;
+        set_device(ec, 0);
+        definition.capture(ec.dev[0]->stream, [&] {
+            foreign = memcpy_device_async(copied.data(), remote.data(), kBytes, ec.dev[0]->stream);
+            own     = memcpy_device_async(copied.data(), local.data(), kBytes, ec.dev[0]->stream);
+        });
+        if (definition.node_count() != 1) {
+            std::cerr << "core capture guard: " << definition.node_count()
+                      << " graph nodes, expected the local copy alone\n";
+            ++failures;
+        }
+        DecodeGraphExecutable executable;
+        executable.instantiate(definition);
+        executable.launch(ec.dev[0]->stream);
+        synchronize_both(ec);
+    }
+    if (foreign != cudaErrorNotSupported || own != cudaSuccess) {
+        std::cerr << "core capture guard: cross-device copy returned " << cudaGetErrorName(foreign)
+                  << ", local copy " << cudaGetErrorName(own) << '\n';
+        ++failures;
+    }
+    set_device(ec, 0);
+    failures += verify_exact("core capture guard local copy",
+                             from_device<std::uint8_t>(copied.data(), kBytes),
+                             std::vector<std::uint8_t>(kBytes, 0x22));
+    failures += copied.verify_guards("core capture guard destination");
+    return failures;
+}
+
+// The direct peer pull and its captured paired copies. Requested without direct P2P, PeerEvents
+// must refuse construction; with it, every case below runs on the flags.
+int run_peer_pull_cases(const ExecutionContext& ec, const ops::PeerEvents& events,
+                        bool peer_access) {
+    if (!peer_access) { return run_peer_pull_requires_p2p_case(ec); }
+    int failures                      = 0;
+    const ops::PeerEvents pull_events = make_peer_pull_events(ec);
+    std::cout << "peer pull: active\n";
+    if (pull_events.peer_pull() == nullptr) {
+        std::cerr << "peer pull: no flags although direct P2P is enabled\n";
+        ++failures;
+    }
+    // Independent unrounded FP64 mathematical oracle, in addition to the exact
+    // native/cast-reference comparisons over every encoding class below.
+    failures += run_allreduce_case("peer pull FP64 [5120]", 5120, 1, 1001u, ec, pull_events);
+    failures += run_allreduce_case("peer pull FP64 [5120,6]", 5120, 6, 1003u, ec, pull_events);
+    // Served: the decode row (10 KiB), six tokens (60 KiB), the 64 KiB bound, one vector. Left to
+    // the staged path (captured: the paired copies): 128 bytes past the bound, a 48-token chunk
+    // (480 KiB), the 1024-token prefill chunk (10 MiB) and a payload that is not whole 16-byte
+    // vectors.
+    failures +=
+        run_peer_pull_identity_case("peer pull [5120]", 5120, 1, 901u, ec, events, pull_events);
+    failures +=
+        run_peer_pull_identity_case("peer pull [5120,6]", 5120, 6, 903u, ec, events, pull_events);
+    failures += run_peer_pull_identity_case("peer pull [4096,8] bound", 4096, 8, 905u, ec, events,
+                                            pull_events);
+    failures +=
+        run_peer_pull_identity_case("peer pull [8,1] minimal", 8, 1, 907u, ec, events, pull_events);
+    failures += run_peer_pull_identity_case("peer pull [4104,8] past the bound", 4104, 8, 909u, ec,
+                                            events, pull_events);
+    failures +=
+        run_peer_pull_identity_case("peer pull [5120,48]", 5120, 48, 911u, ec, events, pull_events);
+    failures += run_peer_pull_identity_case("peer pull [5120,1024]", 5120, 1024, 913u, ec, events,
+                                            pull_events);
+    failures += run_peer_pull_identity_case("peer pull [5121] partial vector", 5121, 1, 915u, ec,
+                                            events, pull_events);
+    // Reuse without host synchronization: interleaved with the event-ordered all-gather, replayed
+    // with fresh inputs, back-to-back launches and an eager call after them.
+    failures += run_chained_case("chained peer pull", ec, pull_events);
+    failures +=
+        run_captured_case("captured peer pull [5120]", 5120, 1, 5, false, ec, pull_events, nullptr);
+    failures += run_captured_case("captured peer pull [5120,6]", 5120, 6, 5, false, ec, pull_events,
+                                  nullptr);
+    // The original odd-length staged case, now on the paired copies.
+    failures += run_captured_case("captured paired copies [5121]", 5121, 1, 3, false, ec,
+                                  pull_events, nullptr);
+    failures += run_peer_pull_mixed_case("mixed staged", ec, events);
+    failures += run_peer_pull_mixed_case("mixed peer pull", ec, pull_events);
+    // An attached mailbox keeps the captured calls that fit its slot (one node per device and
+    // site); the peer pull takes the wider ones. An attached HostExchange keeps the eager calls.
+    ops::PeerMailbox pull_mailbox(ec, 5120 * 4 * sizeof(std::uint16_t));
+    ops::PeerEvents pull_mailbox_events = make_peer_pull_events(ec);
+    pull_mailbox_events.attach_mailbox(&pull_mailbox);
+    failures += run_captured_case("captured mailbox before peer pull [5120]", 5120, 1, 3, true, ec,
+                                  pull_mailbox_events, &pull_mailbox);
+    failures += run_captured_case("captured peer pull past the mailbox slot [5120,6]", 5120, 6, 3,
+                                  false, ec, pull_mailbox_events, &pull_mailbox);
+    ops::HostExchange pull_exchange(ec);
+    ops::PeerEvents pull_exchange_events = make_peer_pull_events(ec);
+    pull_exchange_events.attach_host_exchange(&pull_exchange);
+    failures += run_captured_case("captured peer pull, eager host exchange [5120]", 5120, 1, 3,
+                                  false, ec, pull_exchange_events, nullptr);
+    failures += run_peer_pull_ownership_case(ec, peer_access, events);
+
+    // Captured paired copies: the decode row both ways, odd sizes, one direction of the logits
+    // gather at six columns ([124160, 6] BF16) and of a large odd payload, unaligned operands
+    // (byte route), a single byte.
+    failures +=
+        run_peer_copy_pair_case("paired copy [10240 B, 10240 B]", 10240, 10240, 0, ec, pull_events);
+    failures += run_peer_copy_pair_case("paired copy odd [10242 B, 10241 B]", 10242, 10241, 0, ec,
+                                        pull_events);
+    failures += run_peer_copy_pair_case("paired copy rank 0 only [1489920 B]", 1489920, 0, 0, ec,
+                                        pull_events);
+    failures += run_peer_copy_pair_case("paired copy rank 1 only [3 MiB + 7 B]", 0,
+                                        (std::size_t{3} << 20) + 7, 0, ec, pull_events);
+    failures += run_peer_copy_pair_case("paired copy unaligned [5121 B, 33 B]", 5121, 33, 1, ec,
+                                        pull_events);
+    failures += run_peer_copy_pair_case("paired copy [1 B, 0 B]", 1, 0, 0, ec, pull_events);
+    failures += run_peer_copy_update_case(ec, pull_events);
+    // GPU-produced operands, the fused reduction and the paired copies on the same flags.
+    failures +=
+        run_peer_copy_publication_case("paired copy publication [5120]", 5120, ec, pull_events);
+    failures +=
+        run_peer_copy_publication_case("paired copy publication [5121]", 5121, ec, pull_events);
+
+    run_captured_microbenchmark("peer pull", ec, pull_events);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -810,6 +1595,17 @@ int main() {
                               : "unavailable (CUDA stages the device-to-device copies through "
                                 "host memory)")
               << '\n';
+    // The baseline follows the process selection (file comment): the staged control by default,
+    // the peer-pull flags on every case with NINFER_TP_PEER_PULL=1.
+    std::cout << "selection: "
+              << (peer_pull_selected() ? "NINFER_TP_PEER_PULL=1 (peer pull, paired copies)"
+                                       : "default (staged)")
+              << '\n';
+    if (peer_pull_selected() && !peer_access) {
+        std::cerr << "NINFER_TP_PEER_PULL=1 requires direct P2P in both directions\n";
+        std::cout << "FAIL allreduce\n";
+        return 1;
+    }
     const ops::PeerEvents events(ec);
 
     int failures = 0;
@@ -829,7 +1625,7 @@ int main() {
     failures += run_allgather_case("allgather_rows [5120,3] uneven", 2, 1, 5120, 203u, ec, events);
     failures += run_allgather_case("allgather_rows [7,2] minimal", 1, 1, 7, 204u, ec, events);
 
-    failures += run_chained_case(ec, events);
+    failures += run_chained_case("chained", ec, events);
 
     // Captured transports. The mailbox slot holds the MTP-3 verification activation [5120, 4];
     // the [5120, 8] case exceeds it and must stay staged inside the same kind of graph.
@@ -906,6 +1702,9 @@ int main() {
 
     failures += run_mailbox_hang_case(ec, ops::PeerExchangeKernel::Pipelined);
     failures += run_mailbox_hang_case(ec, ops::PeerExchangeKernel::Legacy);
+
+    failures += run_core_capture_guard_case(ec);
+    failures += run_peer_pull_cases(ec, events, peer_access);
 
     failures += run_microbenchmark(ec, events);
     run_captured_microbenchmark("staged", ec, events);
