@@ -1,4 +1,7 @@
 #include "models/qwen3_5/program/planning/pressure_planner.h"
+#include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/planning/host_pressure_seed.h"
+#include <chrono>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -483,6 +486,377 @@ PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
     result.session_    = this;
     result.generation_ = generation;
     result.index_      = index;
+    return result;
+}
+
+std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::deficit_cover_target(
+    runtime::PlanningCandidateId id, std::span<const runtime::PlanningOwnerId> owner_order,
+    bool evict_private_for_publication, std::uint64_t budget_ns,
+    MaterializationSeedDiagnostics& diagnostics) {
+    diagnostics             = {};
+    using SeedClock         = std::chrono::steady_clock;
+    const auto seed_started = SeedClock::now();
+    if (scratch_live) throw std::logic_error("pressure expansion scratch is live");
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    auto& options         = candidate_options[selected];
+    const auto& candidate = *candidates[selected].state;
+    const auto protection = program->materialization_source_protection(candidate);
+    if (!protection) throw std::logic_error("deficit-cover seed source is stale");
+    using Access               = qwen3_5::detail::RuntimeContractAccess;
+    const auto protected_owner = [&](const Owner& owner) {
+        return owner.shared
+                   ? candidate.has_shared_source &&
+                         Access::index(*owner.shared_handle) == candidate.shared_source_index
+                   : protection->private_source_index &&
+                         Access::index(*owner.private_handle) == *protection->private_source_index;
+    };
+    // Session construction excludes both source kinds from the victim set.
+    // Keep the maximal-target guard aligned with that source-specific contract.
+    for (const auto& victim : options.victims)
+        if (protected_owner(owners[victim.owner_index]))
+            throw std::logic_error("deficit-cover victim includes its protected source");
+    choice_scratch.assign(options.victims.size(), 0);
+    detail::PhysicalDelta pressure;
+    const auto victim_for = [&](runtime::PlanningOwnerId owner) {
+        auto found = std::lower_bound(options.victims.begin(), options.victims.end(), owner.value,
+                                      [&](const auto& victim, std::uint32_t value) {
+                                          return owners[victim.owner_index].id.value < value;
+                                      });
+        return found != options.victims.end() && owners[found->owner_index].id == owner
+                   ? static_cast<std::size_t>(found - options.victims.begin())
+                   : options.victims.size();
+    };
+    if (evict_private_for_publication) {
+        bool released = false;
+        for (auto owner_id : owner_order) {
+            const auto index = victim_for(owner_id);
+            if (index == options.victims.size()) continue;
+            const auto& victim = options.victims[index];
+            if (owners[victim.owner_index].shared || protected_owner(owners[victim.owner_index]))
+                continue;
+            choice_scratch[index] = victim.eviction_choice;
+            const auto& decision  = victim.decisions[victim.eviction_choice - 1U];
+            pressure              = decision.effect;
+            released              = true;
+            break;
+        }
+        if (!released) return std::nullopt;
+    }
+    // A single pass over owners covers remaining Device deficits. Already-selected physical
+    // replicas are excluded globally, so private/shared aliases cannot receive duplicate credit.
+    program->begin_pressure_page_scratch();
+    std::vector<StateImageHandle> state_targets;
+    state_targets.reserve(2U * owners.size());
+    PressureReplicaExclusions exclusions{.page_generation =
+                                             program->pressure_page_scratch_generation_};
+    const auto mark_pages = [&](const SequenceKVBundle& kv, const PressureDecision& decision) {
+        const auto mark = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                              KVAddressSpaceHandle address, const auto& changes) {
+            for (const auto& action : changes)
+                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                    auto logical = addresses.logical_page(address, action.begin_page + offset);
+                    program->pressure_page_scratch(pages, logical).pressure_targeted = true;
+                }
+        };
+        mark(*program->text_kv_addresses, *program->text_kv_pages, kv.text,
+             decision.main_kv_changes);
+        if (!decision.backend_kv_changes.empty()) {
+            if (!kv.backend || !program->backend_kv_addresses || !program->backend_kv_pages)
+                throw std::logic_error("deficit-cover seed backend is absent");
+            mark(*program->backend_kv_addresses, *program->backend_kv_pages, *kv.backend,
+                 decision.backend_kv_changes);
+        }
+    };
+    auto residual = program->guided_materialization_deficit(candidate, pressure);
+    for (auto owner_id : owner_order) {
+        if (residual.device.active_lanes != 0) return std::nullopt;
+        if (residual.device == detail::PhysicalDeviceResources{}) break;
+        // First cover Device demand with preserving actions, accounting for any
+        // additional Host consumption. Phase two frees Host capacity jointly.
+        auto device_deficit = residual;
+        device_deficit.host = {};
+        const auto index    = victim_for(owner_id);
+        if (index == options.victims.size() || choice_scratch[index] != 0) continue;
+        auto& victim             = options.victims[index];
+        const auto& owner        = owners[victim.owner_index];
+        exclusions.state_targets = state_targets;
+        const SequenceState* sequence =
+            owner.shared ? nullptr
+                         : &program->continuation_states[Access::index(*owner.private_handle)];
+        const SharedPrefixState* shared =
+            owner.shared ? &program->shared_prefix_states[Access::index(*owner.shared_handle)]
+                         : nullptr;
+        auto decision =
+            owner.shared ? program->inspect_shared_pressure_option(
+                               *shared, device_deficit, &*protection, nullptr, &exclusions)
+                         : program->inspect_pressure_option(*sequence, device_deficit, &*protection,
+                                                            nullptr, {}, {}, nullptr, &exclusions);
+        if (!decision) continue;
+        if (decision->evicts_continuation || decision->checkpoint_drops != 0 ||
+            (owner.shared
+                 ? !program->shared_pressure_decision_valid(*shared, *decision, &*protection)
+                 : !program->pressure_decision_valid(*sequence, *decision, &*protection)))
+            continue;
+        for (auto action : decision->state_changes) {
+            const auto state = pressure_state_source(action, sequence, shared);
+            if (!state) throw std::logic_error("deficit-cover seed StateImage is absent");
+            state_targets.push_back(*state);
+        }
+        const auto* kv = sequence ? (sequence->kv ? &*sequence->kv : nullptr)
+                                  : (shared->kv ? &*shared->kv : nullptr);
+        if (!kv) throw std::logic_error("deficit-cover seed KV is absent");
+        mark_pages(*kv, *decision);
+        pressure.added   = checked_resource_sum(pressure.added, decision->effect.added);
+        pressure.removed = checked_resource_sum(pressure.removed, decision->effect.removed);
+        auto found       = std::find(victim.decisions.begin(), victim.decisions.end(), *decision);
+        if (found == victim.decisions.end()) {
+            if (victim.decisions.size() == std::numeric_limits<std::uint16_t>::max())
+                throw std::length_error("deficit-cover seed owner options are full");
+            victim.decisions.push_back(std::move(*decision));
+            choice_scratch[index] = static_cast<std::uint16_t>(victim.decisions.size());
+        } else
+            choice_scratch[index] =
+                static_cast<std::uint16_t>(1U + found - victim.decisions.begin());
+        residual = program->guided_materialization_deficit(candidate, pressure);
+    }
+    if (residual.device.active_lanes != 0) return std::nullopt;
+    if (residual != detail::PhysicalResources{} || candidate.blocked_host_allocation_bytes != 0) {
+        const auto base_choices = choice_scratch;
+        std::vector<std::size_t> eviction_order;
+        for (auto owner_id : owner_order) {
+            const auto index = victim_for(owner_id);
+            if (index == options.victims.size() ||
+                base_choices[index] == options.victims[index].eviction_choice ||
+                protected_owner(owners[options.victims[index].owner_index]))
+                continue;
+            eviction_order.push_back(index);
+        }
+        const auto choose_prefix = [&](std::size_t count) {
+            choice_scratch = base_choices;
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto index      = eviction_order[i];
+                choice_scratch[index] = options.victims[index].eviction_choice;
+            }
+        };
+        choose_prefix(eviction_order.size());
+        bool would_evict_all = true;
+        for (std::size_t i = 0; i < options.victims.size(); ++i)
+            would_evict_all &= choice_scratch[i] == options.victims[i].eviction_choice;
+        const auto maximum =
+            eviction_order.size() - std::size_t(would_evict_all && !eviction_order.empty());
+
+        std::vector<const ContinuationHandle*> private_handles;
+        std::vector<runtime::PlanningOwnerId> private_ids;
+        std::vector<const PressureDecision*> private_decisions;
+        std::vector<const SharedPrefixHandle*> shared_handles;
+        std::vector<runtime::PlanningOwnerId> shared_ids;
+        std::vector<const PressureDecision*> shared_decisions;
+        private_handles.reserve(options.victims.size());
+        private_ids.reserve(options.victims.size());
+        private_decisions.reserve(options.victims.size());
+        shared_handles.reserve(options.victims.size());
+        shared_ids.reserve(options.victims.size());
+        shared_decisions.reserve(options.victims.size());
+        const auto& binding = candidates[selected];
+        std::optional<AdmissionCandidateImpl> admission_probe;
+        std::optional<CapturePressureCandidateImpl> capture_probe;
+        std::uint64_t longest_probe_ns = 0;
+        const auto can_probe           = [&] {
+            const auto elapsed =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               SeedClock::now() - seed_started)
+                                                         .count());
+            return elapsed < budget_ns && longest_probe_ns <= budget_ns - elapsed;
+        };
+        std::vector<std::uint16_t> proved_choices;
+        proved_choices.reserve(options.victims.size());
+        const auto reset_probe = [&]() -> CandidateState& {
+            if (binding.admission != nullptr) {
+                if (admission_probe)
+                    *admission_probe = *binding.admission;
+                else
+                    admission_probe.emplace(*binding.admission);
+                return *admission_probe;
+            }
+            if (capture_probe)
+                *capture_probe = *binding.capture;
+            else
+                capture_probe.emplace(*binding.capture);
+            return *capture_probe;
+        };
+        const auto compose_current = [&](CandidateState& copy) {
+            ++diagnostics.physical_probes;
+            private_handles.clear();
+            private_ids.clear();
+            private_decisions.clear();
+            shared_handles.clear();
+            shared_ids.clear();
+            shared_decisions.clear();
+            for (std::size_t i = 0; i < options.victims.size(); ++i) {
+                if (choice_scratch[i] == 0) continue;
+                const auto& victim   = options.victims[i];
+                const auto& owner    = owners[victim.owner_index];
+                const auto* decision = &victim.decisions[choice_scratch[i] - 1U];
+                if (owner.shared) {
+                    shared_handles.push_back(owner.shared_handle);
+                    shared_ids.push_back(owner.id);
+                    shared_decisions.push_back(decision);
+                } else {
+                    private_handles.push_back(owner.private_handle);
+                    private_ids.push_back(owner.id);
+                    private_decisions.push_back(decision);
+                }
+            }
+            return program->compose_pressure_candidate(copy, private_handles, private_ids,
+                                                       private_decisions, shared_handles,
+                                                       shared_ids, shared_decisions);
+        };
+        const auto fits_prefix = [&](std::size_t count) {
+            const auto probe_started = SeedClock::now();
+            choose_prefix(count);
+            auto& copy    = reset_probe();
+            bool composed = compose_current(copy);
+            auto exact    = program->materialization_deficit(copy);
+            bool closed   = false;
+            if (composed && exact.device.active_lanes == 0 &&
+                exact.device != detail::PhysicalDeviceResources{} && can_probe()) {
+                // Eviction can remove the owner carrying a physical demotion while
+                // a surviving alias still needs that replica moved out of Device.
+                // Rebuild exclusions for the actual surviving choices, then extend
+                // their preserving actions against the exact post-eviction deficit.
+                program->begin_pressure_page_scratch();
+                state_targets.clear();
+                exclusions.page_generation = program->pressure_page_scratch_generation_;
+                for (std::size_t i = 0; i < options.victims.size(); ++i) {
+                    const auto& victim = options.victims[i];
+                    if (choice_scratch[i] == 0 || choice_scratch[i] == victim.eviction_choice)
+                        continue;
+                    const auto& owner    = owners[victim.owner_index];
+                    const auto& decision = victim.decisions[choice_scratch[i] - 1U];
+                    const auto* sequence =
+                        owner.shared
+                            ? nullptr
+                            : &program->continuation_states[Access::index(*owner.private_handle)];
+                    const auto* shared =
+                        owner.shared
+                            ? &program->shared_prefix_states[Access::index(*owner.shared_handle)]
+                            : nullptr;
+                    for (auto action : decision.state_changes) {
+                        auto state = pressure_state_source(action, sequence, shared);
+                        if (!state)
+                            throw std::logic_error("survivor pressure StateImage is absent");
+                        state_targets.push_back(*state);
+                    }
+                    const auto* kv = sequence ? (sequence->kv ? &*sequence->kv : nullptr)
+                                              : (shared->kv ? &*shared->kv : nullptr);
+                    if (!kv) throw std::logic_error("survivor pressure KV is absent");
+                    mark_pages(*kv, decision);
+                }
+                detail::PhysicalDelta extension;
+                for (auto owner_id : owner_order) {
+                    if (exact.device == detail::PhysicalDeviceResources{}) break;
+                    const auto index = victim_for(owner_id);
+                    if (index == options.victims.size()) continue;
+                    auto& victim = options.victims[index];
+                    if (choice_scratch[index] == victim.eviction_choice) continue;
+                    const auto& owner = owners[victim.owner_index];
+                    if (protected_owner(owner)) continue;
+                    const auto* sequence =
+                        owner.shared
+                            ? nullptr
+                            : &program->continuation_states[Access::index(*owner.private_handle)];
+                    const auto* shared =
+                        owner.shared
+                            ? &program->shared_prefix_states[Access::index(*owner.shared_handle)]
+                            : nullptr;
+                    const auto* current      = choice_scratch[index] == 0
+                                                   ? nullptr
+                                                   : &victim.decisions[choice_scratch[index] - 1U];
+                    const auto previous      = current ? current->effect : detail::PhysicalDelta{};
+                    auto device_only         = exact;
+                    device_only.host         = {};
+                    exclusions.state_targets = state_targets;
+                    auto decision =
+                        owner.shared ? program->inspect_shared_pressure_option(
+                                           *shared, device_only, &*protection, current, &exclusions)
+                                     : program->inspect_pressure_option(*sequence, device_only,
+                                                                        &*protection, nullptr, {},
+                                                                        {}, current, &exclusions);
+                    if (!decision || decision->evicts_continuation ||
+                        decision->checkpoint_drops != 0 ||
+                        (owner.shared ? !program->shared_pressure_decision_valid(*shared, *decision,
+                                                                                 &*protection)
+                                      : !program->pressure_decision_valid(*sequence, *decision,
+                                                                          &*protection)))
+                        continue;
+                    extension.added = checked_resource_sum(
+                        extension.added,
+                        checked_resource_difference(decision->effect.added, previous.added));
+                    extension.removed = checked_resource_sum(
+                        extension.removed,
+                        checked_resource_difference(decision->effect.removed, previous.removed));
+                    for (auto action : decision->state_changes) {
+                        auto state = pressure_state_source(action, sequence, shared);
+                        if (!state)
+                            throw std::logic_error("extended survivor StateImage is absent");
+                        state_targets.push_back(*state);
+                    }
+                    const auto* kv = sequence ? (sequence->kv ? &*sequence->kv : nullptr)
+                                              : (shared->kv ? &*shared->kv : nullptr);
+                    if (!kv) throw std::logic_error("extended survivor KV is absent");
+                    mark_pages(*kv, *decision);
+                    auto found =
+                        std::find(victim.decisions.begin(), victim.decisions.end(), *decision);
+                    if (found == victim.decisions.end()) {
+                        if (victim.decisions.size() == std::numeric_limits<std::uint16_t>::max())
+                            throw std::length_error("survivor pressure options are full");
+                        victim.decisions.push_back(std::move(*decision));
+                        choice_scratch[index] = static_cast<std::uint16_t>(victim.decisions.size());
+                    } else
+                        choice_scratch[index] =
+                            static_cast<std::uint16_t>(1U + found - victim.decisions.begin());
+                    exact = program->guided_materialization_deficit(copy, extension);
+                }
+                // Provisional deltas select actions only; never certify a target.
+                if (can_probe()) {
+                    reset_probe();
+                    composed = compose_current(copy);
+                    exact    = program->materialization_deficit(copy);
+                    closed   = true;
+                } else
+                    composed = false;
+            }
+            const bool feasible = composed && copy.blocked_host_allocation_bytes == 0 &&
+                                  program->physical_peak_fits(copy.demand.physical_peak_additional);
+            if (feasible) proved_choices = choice_scratch;
+            const auto probe_ns =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               SeedClock::now() - probe_started)
+                                               .count());
+            longest_probe_ns = std::max(longest_probe_ns, probe_ns);
+            return feasible;
+        };
+        if (!can_probe()) return std::nullopt;
+        const auto prefix = fits_prefix(0) ? std::optional<std::size_t>(0)
+                                           : host_eviction_prefix(maximum, fits_prefix, can_probe);
+        if (!prefix) return std::nullopt;
+        choice_scratch             = proved_choices;
+        diagnostics.evicted_owners = static_cast<std::uint32_t>(*prefix);
+    }
+    bool all_evicted = true;
+    for (std::size_t index = 0; index < options.victims.size(); ++index)
+        all_evicted =
+            all_evicted && choice_scratch[index] == options.victims[index].eviction_choice;
+    if (all_evicted) {
+        diagnostics.evicted_owners = 0;
+        return std::nullopt;
+    }
+    const auto ordinal = intern_target(selected, choice_scratch);
+    qwen3_5::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = ordinal;
     return result;
 }
 
