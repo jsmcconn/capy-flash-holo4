@@ -576,6 +576,10 @@ reads of already-published prefixes do not require the request to repeat a marke
 When four explicit writes are already present, an absent implicit target does not displace
 any of them.
 
+`prompt_cache_options.before_images: true` requests additional automatic checkpoints before
+media-bearing turns, preserving reusable text when later images change. It is opt-in, follows
+implicit-mode policy, and shares the four-write limit with explicit and ordinary implicit
+boundaries. `mode:"explicit"` disables these automatic writes.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an

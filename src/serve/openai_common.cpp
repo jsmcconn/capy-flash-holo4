@@ -3,7 +3,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <iterator>
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -105,6 +107,13 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
         (!options.at("ttl").is_string() || options.at("ttl").get<std::string>() != "30m")) {
         bad_request("prompt_cache_options.ttl must be '30m'", "prompt_cache_options");
     }
+    if (options.contains("before_images") && !options.at("before_images").is_null()) {
+        if (!options.at("before_images").is_boolean()) {
+            bad_request("prompt_cache_options.before_images must be a boolean",
+                        "prompt_cache_options");
+        }
+        policy.before_images = options.at("before_images").get<bool>();
+    }
     return policy;
 }
 
@@ -172,6 +181,35 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             automatic_target->value().evidence |= evidence;
         } else {
             *automatic_target = CacheBoundary{.evidence = evidence};
+        }
+    }
+    if (policy.before_images && policy.automatic != OpenAIPromptCacheAutomatic::Disabled) {
+        std::size_t writes = explicit_boundaries.size() - first_selected +
+                             (automatic_enabled && !automatic_merges_explicit ? 1U : 0U);
+        // Preserve the earliest media turns: rolling screenshot history edits its oldest
+        // retained image first. Existing exact checkpoint machinery owns capture and reuse.
+        for (std::size_t index = 0; index < request.messages.size(); ++index) {
+            if (writes == kMaximumExplicitPromptCacheMarkers) { break; }
+            auto& turn = request.messages[index];
+            const auto media =
+                std::find_if(turn.content.begin(), turn.content.end(), [](const ContentPart& part) {
+                    return part.kind != ContentKind::Text;
+                });
+            if (media == turn.content.end()) { continue; }
+            std::optional<CacheBoundary>* target = nullptr;
+            if (index != 0) {
+                target = &request.messages[index - 1U].cache_boundary_after;
+            } else if (media != turn.content.begin()) {
+                target = &std::prev(media)->cache_boundary_after;
+            }
+            if (!target) { continue; }
+            if (*target) {
+                target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
+            } else {
+                *target =
+                    CacheBoundary{.evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic};
+                ++writes;
+            }
         }
     }
     // OpenAI already defines the automatic/explicit write policy for every request. Existing
