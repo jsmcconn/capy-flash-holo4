@@ -49,6 +49,14 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
+    failures += check(!defaults.context_cache.retain_dormant_shared &&
+                          !defaults.context_cache.trace_shared_lifecycle,
+                      "experimental retention or diagnostic trace enabled by default");
+    const auto shared_flags = parse(
+        {"ninfer-serve", "model.ninfer", "--retain-dormant-shared", "--trace-shared-lifecycle"});
+    failures += check(shared_flags.context_cache.retain_dormant_shared &&
+                          shared_flags.context_cache.trace_shared_lifecycle,
+                      "shared retention/trace flags did not reach Engine options");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");

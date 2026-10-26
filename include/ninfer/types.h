@@ -162,6 +162,10 @@ struct ContextCacheOptions {
     // set (--host-state-slots / --host-kv-mib, or a profile). Engine::options() returns those
     // effective values.
     bool enabled = true;
+    // Opt-in retention prior for inactive shared histories.
+    bool retain_dormant_shared = false;
+    // Diagnostic Shared catalog lifecycle events on stderr; does not change policy.
+    bool trace_shared_lifecycle = false;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.

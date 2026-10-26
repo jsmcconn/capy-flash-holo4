@@ -79,7 +79,9 @@ public:
                      // A tp 2 server without Host StateImages has nowhere to put a prefill
                      // checkpoint when the Device pool is full. With them, and at tp 1, the
                      // checkpoint spills to the Host as upstream's does.
-                     options.tp > 1 && options.context_cache.host_state_slots == 0) {
+                     options.tp > 1 && options.context_cache.host_state_slots == 0,
+                     options.context_cache.retain_dormant_shared,
+                     options.context_cache.trace_shared_lifecycle ? stderr : nullptr) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
