@@ -329,8 +329,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                      {std::pair{peer->anchors, round.anchors},
                       std::pair{peer->frontiers, round.frontiers},
                       std::pair{peer->licensed_counts, round.licensed_counts}}) {
-                    CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data,
-                                                             source.bytes(), rank1->stream));
+                    if (!ops::captured_peer_copy_pair(
+                            {nullptr, source.data}, {nullptr, destination.data},
+                            {0, source.bytes()}, *tp->execution, events)) {
+                        CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data,
+                                                                 source.bytes(), rank1->stream));
+                    }
                 }
                 prepare_next_round(*peer, max_context, rank1->stream);
             }
