@@ -334,6 +334,54 @@ int test_typed_items_and_cache_markers() {
                           translated.context_cache.markers[1].kind ==
                               ninfer::PromptCacheMarkerKind::SharedStablePrefix,
                       "Responses breakpoints become shared Engine part boundaries");
+    Json media_hints                    = body;
+    media_hints["prompt_cache_options"] = Json{{"before_images", true}};
+    const auto media_request = parse_openai_responses_create_request(media_hints, limits());
+    const auto media_resolved =
+        resolve_openai_responses_prompt(media_request.prompt, store, std::nullopt, false);
+    failures += check(
+        !resolved.generation.messages.empty() && !media_resolved.generation.messages.empty() &&
+            !resolved.generation.messages.front().cache_boundary_after &&
+            media_resolved.generation.messages.front().cache_boundary_after &&
+            media_resolved.generation.messages.front().cache_boundary_after->evidence ==
+                ninfer::SharedCandidateEvidence::RequestedAutomatic,
+        "Responses image-bearing tool outputs add a resolved pre-media boundary");
+    media_hints["prompt_cache_options"]["mode"] = "explicit";
+    const auto explicit_media = parse_openai_responses_create_request(media_hints, limits());
+    const auto explicit_resolved =
+        resolve_openai_responses_prompt(explicit_media.prompt, store, std::nullopt, false);
+    failures += check(!explicit_resolved.generation.messages.empty() &&
+                          !explicit_resolved.generation.messages.front().cache_boundary_after,
+                      "Responses explicit mode disables automatic pre-media boundaries");
+    store.put(stored_parent(append_openai_response_context(
+        {}, {text_turn(ninfer::ChatRole::User, "Inspect the returned image"),
+             call_turn({{"call_image", "inspect"}})})));
+    Json child_body = {
+        {"model", "m"},
+        {"previous_response_id", "resp_parent"},
+        {"prompt_cache_options", Json{{"before_images", true}}},
+        {"input",
+         Json::array({Json{
+             {"type", "function_call_output"},
+             {"call_id", "call_image"},
+             {"output", Json::array({Json{{"type", "input_image"},
+                                          {"image_url", "data:image/png;base64,AA=="}}})}}})}};
+    const auto child_request = parse_openai_responses_create_request(child_body, limits());
+    const auto child =
+        resolve_openai_responses_prompt(child_request.prompt, store, std::nullopt, false);
+    failures += check(child.generation.messages.size() == 3 &&
+                          child.generation.messages[1].cache_boundary_after,
+                      "Pre-media boundaries include previous_response_id tool-call history");
+    const auto stored_history = flatten_openai_response_context(store.get("resp_parent")->context);
+    failures += check(stored_history.size() == 2 && !stored_history[1].cache_boundary_after,
+                      "Pre-media policy must not mark the stored parent assistant turn");
+    child_body["prompt_cache_options"]["mode"] = "explicit";
+    const auto explicit_child_request = parse_openai_responses_create_request(child_body, limits());
+    const auto explicit_child =
+        resolve_openai_responses_prompt(explicit_child_request.prompt, store, std::nullopt, false);
+    failures += check(explicit_child.generation.messages.size() == 3 &&
+                          !explicit_child.generation.messages[1].cache_boundary_after,
+                      "Explicit mode also suppresses a stored-parent pre-media boundary");
     return failures;
 }
 

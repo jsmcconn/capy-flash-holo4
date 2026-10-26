@@ -91,6 +91,77 @@ int test_full_explicit_marker_set() {
     return failures;
 }
 
+int test_before_image_checkpoints() {
+    using Location          = ninfer::PromptCacheMarkerLocation;
+    int failures            = 0;
+    const auto media_prompt = [&](const Json& body) {
+        const auto request = parse(body).generation;
+        return to_prompt_input(request, semantics(request),
+                               [](const ContentPart&) { return ninfer::OwnedMedia{}; });
+    };
+    const Json image = Json{{"type", "image_url"},
+                            {"image_url", Json{{"url", "https://example.test/fixture.png"}}}};
+    Json rolling     = base_request();
+    for (int index = 0; index < 4; ++index) {
+        rolling["messages"].push_back(Json{{"role", "assistant"}, {"content", "observe"}});
+        rolling["messages"].push_back(Json{{"role", "user"}, {"content", Json::array({image})}});
+    }
+    failures += check(media_prompt(rolling).context_cache.markers.size() == 1,
+                      "media checkpoints are opt-in");
+    rolling["prompt_cache_options"] = Json{{"before_images", true}};
+    const auto protected_media      = media_prompt(rolling);
+    failures += check(protected_media.context_cache.markers.size() == 4,
+                      "earliest three media turns plus latest content stay within four writes");
+    for (std::size_t index = 0; index < 3 && index < protected_media.context_cache.markers.size();
+         ++index) {
+        const auto& marker = protected_media.context_cache.markers[index];
+        failures += check(marker.location == Location::MessageBoundary &&
+                              marker.after_message_count == 2U + 2U * index,
+                          "media checkpoint precedes its image-bearing message");
+    }
+    rolling["prompt_cache_options"]["mode"] = "explicit";
+    failures += check(media_prompt(rolling).context_cache.markers.empty(),
+                      "explicit mode disables automatic media checkpoints");
+    rolling["prompt_cache_options"] = Json{{"before_images", false}};
+    failures += check(media_prompt(rolling).context_cache.markers.size() == 1,
+                      "before_images false preserves the original policy");
+    for (const Json& value : {Json(1), Json("yes")}) {
+        rolling["prompt_cache_options"]["before_images"] = value;
+        failures += check(api_error([&] { (void)parse(rolling); }).status == 400,
+                          "invalid media checkpoint option rejected");
+    }
+    rolling["prompt_cache_options"]  = Json{{"before_images", true}};
+    Json marked                      = base_request();
+    marked["messages"][0]["content"] = Json::array();
+    for (int index = 0; index < 4; ++index) {
+        marked["messages"][0]["content"].push_back(
+            Json{{"type", "text"},
+                 {"text", "explicit marker"},
+                 {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}});
+    }
+    using Evidence               = ninfer::SharedCandidateEvidence;
+    rolling["messages"][0]       = marked["messages"][0];
+    const auto explicit_priority = media_prompt(rolling);
+    failures += check(explicit_priority.context_cache.markers.size() == 4,
+                      "media policy does not displace four explicit markers");
+    for (const auto& marker : explicit_priority.context_cache.markers) {
+        failures +=
+            check(marker.evidence == Evidence::ExplicitBoundary && marker.after_message_count == 1,
+                  "explicit markers retain priority over media hints");
+    }
+    Json inline_media = base_request();
+    inline_media["messages"][0]["content"] =
+        Json::array({Json{{"type", "text"}, {"text", "history"}}, image});
+    inline_media["prompt_cache_options"] = Json{{"before_images", true}};
+    const auto inline_points             = media_prompt(inline_media);
+    failures += check(inline_points.context_cache.markers.size() == 2 &&
+                          inline_points.context_cache.markers[0].after_message_part_count == 1 &&
+                          inline_points.context_cache.markers[1].after_message_part_count == 2,
+                      "first-turn media protects its preceding text part");
+
+    return failures;
+}
+
 int test_request_envelope_and_sampling() {
     int failures                  = 0;
     Json body                     = base_request();
@@ -811,7 +882,7 @@ int test_common_objects() {
 int main() {
     int failures = 0;
     failures += test_full_explicit_marker_set();
-    failures += test_request_envelope_and_sampling();
+    failures += test_before_image_checkpoints() + test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
