@@ -1038,6 +1038,11 @@ public:
         return {fake_recovery_work(0)};
     }
 
+    [[nodiscard]] static std::vector<CheckpointRecoveryAlternativeWork>
+    capture_recovery_lower_bound_work(std::vector<CheckpointRecoveryAlternativeWork> work) {
+        return work;
+    }
+
     [[nodiscard]] FakePressurePlanningSession
     begin_capture_pressure_planning(const FakeCaptureAssessment& assessment,
                                     std::span<const FakeContinuationHandle* const> private_owners,
@@ -1296,6 +1301,7 @@ public:
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
     std::optional<std::uint64_t> required_action_id;
     std::uint32_t pressure_assessment_delay_us           = 0;
+    void (*pressure_assessment_hook)()                   = nullptr;
     std::uint64_t pressure_checkpoint_recovery_ns        = 100;
     bool require_evictions                               = false;
     bool abort_start                                     = false;
@@ -1814,6 +1820,7 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         std::this_thread::sleep_for(
             std::chrono::microseconds(program_->pressure_assessment_delay_us));
     }
+    if (program_->pressure_assessment_hook) { program_->pressure_assessment_hook(); }
     ++program_->pressure_target_assessments;
     const Target& target = targets_[handle.index];
     populate_options(target.candidate_index);
@@ -2389,6 +2396,209 @@ void test_shared_capture_subtracts_private_transition_loss() {
             "shared capture gain did not subtract the private capability transition loss");
 }
 
+void test_shared_capture_bounds_allow_cheaper_survivors() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
+    std::mt19937 random(20261016);
+    for (unsigned trial = 0; trial < 2000; ++trial) {
+        FakeProgram program;
+        program.required_pressure_actions       = trial % 3U;
+        program.pressure_action_immediate_ns    = random() % 100U;
+        program.pressure_checkpoint_recovery_ns = random() % 2000U;
+        FakeCaptureAssessment capture{
+            .shared_evidence  = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .publishes_shared = true,
+        };
+        std::array<FakeContinuationHandle, 2> handles{FakeContinuationHandle{7, 0},
+                                                      FakeContinuationHandle{8, 0}};
+        const std::array<const FakeContinuationHandle*, 2> owners{&handles[0], &handles[1]};
+        const std::array<PlanningOwnerId, 2> ids{PlanningOwnerId{.value = 0},
+                                                 PlanningOwnerId{.value = 1}};
+        const std::array<Planner::OwnerPolicy, 2> policies{
+            Planner::OwnerPolicy{.owner                    = ids[0],
+                                 .private_retention_weight = trial % 3U,
+                                 .explicit_shared_credit   = true},
+            Planner::OwnerPolicy{.owner = ids[1], .private_retention_weight = trial % 2U},
+        };
+        const std::array<Planner::CheckpointPolicy, 2> checkpoints{
+            Planner::CheckpointPolicy{
+                .owner                = ids[0],
+                .checkpoint           = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+                .demand_mask          = 1,
+                .rebuild_ns           = 1000,
+                .baseline_recovery_ns = random() % 1200U},
+            Planner::CheckpointPolicy{
+                .owner                = ids[1],
+                .checkpoint           = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+                .demand_mask          = trial % 4U,
+                .rebuild_ns           = 2000,
+                .baseline_recovery_ns = random() % 2200U},
+        };
+        Planner::Input input{
+            .capture                   = &capture,
+            .private_owners            = owners,
+            .private_owner_ids         = ids,
+            .owner_policies            = policies,
+            .checkpoint_policies       = checkpoints,
+            .direct_shared_victim      = std::nullopt,
+            .candidate_demand_mask     = trial % 8U,
+            .candidate_rebuild_ns      = random() % 5000U,
+            .blocked_runnable_requests = trial % 3U,
+            .target_budget             = 64,
+            .allowance                 = {.limit_ns = std::numeric_limits<std::uint64_t>::max()},
+        };
+        Planner planner;
+        const auto bounded    = planner.plan(program, test_cost_model(), input);
+        input.prune           = false;
+        const auto exhaustive = planner.plan(program, test_cost_model(), input);
+        require(bool(bounded) == bool(exhaustive), "capture bound pruned a positive target");
+        if (bounded) {
+            require(bounded->net_gain <= bounded->upper_bound &&
+                        !Planner::better(*bounded, *exhaustive) &&
+                        !Planner::better(*exhaustive, *bounded),
+                    "capture bound changed exhaustive selection or underestimated alias savings");
+        }
+    }
+
+    // Releasing a surviving alias may remove its recovery copy even though identity is feasible.
+    // A feasible identity is not a certificate of optimality.
+    FakeProgram program;
+    program.pressure_action_immediate_ns = 0;
+    FakeCaptureAssessment capture{.shared_evidence =
+                                      ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                                  .publishes_shared = true};
+    FakeContinuationHandle handle{7, 0};
+    const std::array<const FakeContinuationHandle*, 1> owners{&handle};
+    const std::array<PlanningOwnerId, 1> ids{PlanningOwnerId{.value = 0}};
+    const std::array<Planner::OwnerPolicy, 1> policies{
+        Planner::OwnerPolicy{.owner = ids[0], .explicit_shared_credit = true}};
+    const std::array<Planner::CheckpointPolicy, 1> checkpoints{Planner::CheckpointPolicy{
+        .owner                = ids[0],
+        .checkpoint           = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+        .rebuild_ns           = 1000,
+        .baseline_recovery_ns = 300}};
+    Planner planner;
+    const auto result = planner.plan(program, test_cost_model(),
+                                     Planner::Input{.capture              = &capture,
+                                                    .private_owners       = owners,
+                                                    .private_owner_ids    = ids,
+                                                    .owner_policies       = policies,
+                                                    .checkpoint_policies  = checkpoints,
+                                                    .candidate_rebuild_ns = 1000});
+    require(result && result->net_gain == 1300 && result->stable_target_ordinal != 0,
+            "feasible identity hid a better alias-recovery target");
+}
+
+void test_shared_capture_search_is_one_cancellable_economic_budget() {
+    using namespace ninfer::runtime;
+    constexpr std::uint64_t start = 1'000'000'000;
+    PlanningAllowance allowance{.started_ns = start, .limit_ns = 50'000'000};
+    CaptureSearchControl control(allowance, 1'000'000'000, start);
+    require(control.allow(1'000'000'000, start), "capture lost its mandatory seed");
+    control.assessed(4'000'000);
+    require(control.allow(1'000'000'000, start + 4'000'000), "capture lost bounded discovery");
+    control.assessed(4'000'000);
+    require(!control.allow(1'000'000'000, start + 11'000'000) && control.wall.renewals() == 1,
+            "capture granted a fresh discovery budget for another scenario");
+    CaptureSearchControl cheap(allowance, 10, start);
+    require(cheap.allow(10, start), "cheap capture lost its seed");
+    cheap.assessed(1'000);
+    require(!cheap.allow(10, start + 1'000),
+            "capture spent more searching than its optimistic gain");
+    std::atomic<bool> cancelled{true};
+    allowance.cancellation = &cancelled;
+    CaptureSearchControl stopped(allowance, 1'000'000'000, start);
+    require(!stopped.allow(1'000'000'000, start), "cancelled capture searched pressure");
+}
+
+void test_capture_rank_bounds_and_probe_order() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
+    std::mt19937 random(12731);
+    for (unsigned i = 0; i < 10000; ++i) {
+        Planner::Result lhs{.net_gain                = random() % 20U,
+                            .stable_scenario_ordinal = static_cast<std::uint32_t>(random() % 4U),
+                            .stable_target_ordinal   = static_cast<std::uint32_t>(random() % 4U),
+                            .degradation_units       = static_cast<std::uint32_t>(random() % 4U),
+                            .dropped_checkpoints     = static_cast<std::uint32_t>(random() % 4U)};
+        Planner::Result rhs{.net_gain                = random() % 20U,
+                            .stable_scenario_ordinal = static_cast<std::uint32_t>(random() % 4U),
+                            .stable_target_ordinal   = static_cast<std::uint32_t>(random() % 4U),
+                            .degradation_units       = static_cast<std::uint32_t>(random() % 4U),
+                            .dropped_checkpoints     = static_cast<std::uint32_t>(random() % 4U)};
+        const auto bound = lhs.net_gain + static_cast<std::uint32_t>(random() % 4U);
+        require(!Planner::better(lhs, rhs) ||
+                    Planner::may_beat(bound, lhs.stable_scenario_ordinal, rhs),
+                "capture scenario bound rejected a better stable rank");
+    }
+    using namespace ninfer::runtime;
+    constexpr std::uint64_t start = 1'000'000'000;
+    CaptureSearchControl search({.started_ns = start, .limit_ns = 50'000'000}, 20'000'000, start);
+    require(search.allow(20'000'000, start), "high bound lost its identity");
+    search.assessed(100'000);
+    require(!search.allow(10, start + 1'100'000) && !search.stopped &&
+                search.stop == CaptureSearchStop::Economic,
+            "low-bound probe stopped all scenarios");
+    require(search.allow(20'000'000, start + 1'100'000),
+            "uneconomic replacement blocked a competitive scenario expansion");
+
+    FakeProgram program;
+    FakeCaptureAssessment capture{.shared_evidence =
+                                      ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                                  .publishes_shared = true};
+    Planner planner;
+    bool complete    = false;
+    const auto first = planner.plan(program, test_cost_model(),
+                                    Planner::Input{.capture              = &capture,
+                                                   .candidate_rebuild_ns = 1000,
+                                                   .target_budget        = 1,
+                                                   .complete             = &complete});
+    require(first && complete && first->targets_evaluated == 1,
+            "proven identity did not close its scenario");
+    const auto before    = program.pressure_target_assessments;
+    const auto dominated = planner.plan(program, test_cost_model(),
+                                        Planner::Input{.capture              = &capture,
+                                                       .candidate_rebuild_ns = 999,
+                                                       .global_best          = &*first,
+                                                       .complete             = &complete});
+    require(!dominated && complete && program.pressure_target_assessments == before,
+            "dominated scenario did unnecessary assessment or seal");
+}
+
+void test_shared_capture_obeys_boundary_time_budget() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
+    FakeProgram program;
+    program.required_pressure_actions    = 6;
+    program.require_evictions            = true;
+    program.pressure_assessment_delay_us = 2'000;
+    FakeCaptureAssessment capture{
+        .shared_evidence     = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .publishes_shared    = true,
+        .physically_feasible = false,
+    };
+    std::array<FakeContinuationHandle, 6> handles{};
+    std::array<const FakeContinuationHandle*, 6> owners{};
+    std::array<PlanningOwnerId, 6> ids{};
+    for (std::uint32_t i = 0; i < handles.size(); ++i) {
+        handles[i] = FakeContinuationHandle{10U + i, 0};
+        owners[i]  = &handles[i];
+        ids[i]     = PlanningOwnerId{.value = i};
+    }
+    Planner planner;
+    const auto result = planner.plan(
+        program, test_cost_model(),
+        Planner::Input{
+            .capture              = &capture,
+            .private_owners       = owners,
+            .private_owner_ids    = ids,
+            .candidate_rebuild_ns = 1'000'000'000,
+            .target_budget        = 64,
+            .allowance =
+                ninfer::runtime::PlanningAllowance{.started_ns = ninfer::runtime::planning_now_ns(),
+                                                   .limit_ns   = 4'000'000},
+        });
+    require(!result && program.pressure_target_assessments <= 4,
+            "optional capture ignored its elapsed boundary budget");
+}
+
 void test_shared_capture_budget_bounds_committed_canonical_targets() {
     using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
 
@@ -2433,6 +2643,7 @@ void test_shared_capture_budget_bounds_committed_canonical_targets() {
                                          .shared_owners     = shared_owners,
                                          .shared_owner_ids  = shared_owner_ids,
                                          .target_budget     = target_budget,
+                                         .prune             = false,
                                      });
     require(!result, "bounded infeasible shared-capture search unexpectedly found a plan");
     require(program.pressure_target_count_peak <= target_budget,
@@ -3656,11 +3867,6 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
-// A long answer's Device KV lease runs out of pool while the only cache pages left on the Device
-// are the prefix pages an idle conversation's continuation shares with the shared prefix it was
-// built on (admission already moved the continuation's own tail to the Host). Neither owner maps
-// those pages alone. Moving either owner's KV to the Host frees them, and then no conversation is
-// lost; without a Host tier, releasing both does. Pages the active answer reads stay.
 void test_lease_reclaim_frees_pages_two_idle_owners_share() {
     for (const bool host_tier : {true, false}) {
         FakeManager manager = make_manager(1, 3, 1);
@@ -3721,9 +3927,6 @@ void test_lease_reclaim_frees_pages_two_idle_owners_share() {
     }
 }
 
-// Drop order: without a Host tier the smallest growth step is taken from an owner whose release
-// returns pages by itself before one that only shares its pages, which would return nothing
-// until its partner goes too.
 void test_lease_reclaim_drops_owner_with_own_pages_first() {
     FakeManager manager = make_manager(1, 3, 1);
     FakeProgram program;
@@ -3768,13 +3971,77 @@ void test_lease_reclaim_drops_owner_with_own_pages_first() {
     (void)finish_active(manager, program, answer);
 }
 
-// An idle continuation whose Device pages are mapped as well by a shared prefix that cannot be
-// released (it holds client credit) frees nothing when it is released: without a Host tier the
-// lease reclaim keeps the conversation and leaves the lease short.
 void test_lease_reclaim_keeps_owner_sharing_pages_with_retained_owner() {
     FakeManager manager = make_manager(1, 3, 1);
     FakeProgram program;
     FakeRequestBasePlan seed_base = make_base(96);
+    seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest seed   = start_active(manager, program, 96, seed_base, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 96, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 44}, 0, {}) ==
+                FakeManager::ActiveCaptureReserveResult::Reserved,
+            "lease fixture could not publish its shared prefix");
+    auto capture_progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress)).status ==
+                ContextTransactionStatus::Published,
+            "lease fixture did not publish its shared prefix");
+    (void)finish_active(manager, program, seed);
+    const ActiveRequest answer = start_active(manager, program, 97, make_base(97), 2);
+
+    program.lease_private_pages[seed.sequence.id] = {0, 1, 2, 3};
+    program.lease_shared_pages[1]                 = {0, 1, 2, 3};
+    program.lease_device_pages                    = {0, 1, 2, 3};
+    program.lease_available_pages                 = 0;
+    program.lease_host_tier                       = false;
+    const std::uint32_t released = manager.reclaim_device_kv_for_lease(program, 1, 0, 1, 0);
+    require(released == 0 && program.released_continuations.empty() &&
+                program.released_shared_prefixes.empty() && program.lease_available_pages == 0,
+            "lease reclaim released a conversation whose pages a credited shared prefix keeps");
+    (void)finish_active(manager, program, answer);
+}
+
+void test_fitting_shared_capture_does_not_search_pressure() {
+    for (bool retain_dormant : {false, true}) {
+        FakeManager manager(1, 4, 2, true, 2, test_cost_model(), false, retain_dormant);
+        FakeProgram program;
+        for (std::uint64_t id : {201U, 202U}) {
+            const ActiveRequest old = start_active(manager, program, id, make_base(id), id);
+            (void)finish_active(manager, program, old);
+        }
+        const ActiveRequest active = start_active(manager, program, 203, make_base(203), 203);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 203, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        const auto before = program.pressure_target_assessments;
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 203}, 0,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "a fitting shared checkpoint was not retained");
+        require(program.pressure_target_assessments == before + 1 &&
+                    program.started_action_ids.empty(),
+                "a fitting shared checkpoint searched disruptive pressure targets");
+        auto progress = manager.progress_context_transaction(program, {});
+        require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                    ContextTransactionStatus::Published,
+                "a fitting shared checkpoint did not publish");
+        (void)finish_active(manager, program, active);
+    }
+}
+
 struct FrozenCaptureClock {
     using duration                  = std::chrono::nanoseconds;
     using rep                       = duration::rep;
@@ -3955,8 +4222,159 @@ void test_shared_replacement_lifecycle_accounts_for_both_ids() {
 
 // The clock advances only on an actual assessment, so the economic discovery
 // episode is deterministic and logging/CPU scheduling cannot consume this budget.
+struct CountedCaptureClock {
+    using duration                    = std::chrono::nanoseconds;
+    using rep                         = duration::rep;
+    using period                      = duration::period;
+    using time_point                  = std::chrono::time_point<CountedCaptureClock>;
+    static constexpr bool is_steady   = true;
+    static inline std::uint64_t ticks = 1'000'000'000;
+
+    static time_point now() noexcept { return time_point(duration(ticks)); }
+};
+
+void test_shared_capture_constructs_cover_before_economic_stop() {
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, CountedCaptureClock>;
+    for (const std::uint32_t shared_slots : {17U, 16U}) {
+        CountedCaptureClock::ticks = 1'000'000'000;
+        Manager manager(1, 64, shared_slots, true, 2, test_cost_model());
+        FakeProgram program;
+        program.pressure_action_immediate_ns = 0;
+        // Sixteen independent Shared owners plus a vacant slot reproduce the seventeen
+        // identity scenarios in the measured full-context capture, without GPU/model work.
+        for (std::uint32_t id = 100; id < 116; ++id) {
+            auto base = make_base(id);
+            base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+                .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                .frontier = 64,
+            });
+            const auto active          = start_active(manager, program, id, base, id);
+            program.capture_assessment = FakeCaptureAssessment{
+                .shortlist_key          = FakeShortlistKey{.digest = id, .frontier = 64},
+                .shared_evidence        = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                .protected_rebuild_work = PrefillWork{.tokens = 64},
+                .publishes_shared       = true,
+            };
+            require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = id},
+                                                   0, {}) ==
+                        Manager::ActiveCaptureReserveResult::Reserved,
+                    "capture starvation fixture failed to populate Shared catalog");
+            auto progress = manager.progress_context_transaction(program, {});
+            require(std::get<Manager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                        ContextTransactionStatus::Published,
+                    "capture starvation fixture publication failed");
+            (void)finish_active(manager, program, active);
+        }
+        auto base = make_base(999);
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+            .frontier = 253403,
+        });
+        const auto active                 = start_active(manager, program, 999, base, 999);
+        program.required_pressure_actions = 2;
+        program.preserving_seed_enabled   = true;
+        program.capture_assessment        = FakeCaptureAssessment{
+                   .shortlist_key   = FakeShortlistKey{.digest = 999, .frontier = 253403},
+                   .shared_evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                   .protected_rebuild_work =
+                PrefillWork{.tokens          = 253403,
+                                   .attention_pairs = std::uint64_t{253403} * 253404 / 2},
+                   .publishes_shared    = true,
+                   .physically_feasible = false,
+        };
+        program.pressure_assessment_hook = [] { CountedCaptureClock::ticks += 500'000; };
+        const auto started               = CountedCaptureClock::ticks;
+        const auto reserved              = manager.reserve_active_capture(program, active.lane,
+                                                                          FakeCaptureOffer{.id = 999}, 0, {});
+        if (reserved != Manager::ActiveCaptureReserveResult::Reserved) {
+            RuntimeStats stats;
+            manager.populate_runtime_stats(program, stats);
+            std::cerr << "capture starvation control: skipped=" << program.skipped_captures
+                      << " elapsed_ns=" << CountedCaptureClock::ticks - started
+                      << " budget_stops=" << stats.capture_search_budget_stops << '\n';
+        }
+        require(reserved == Manager::ActiveCaptureReserveResult::Reserved,
+                "two-owner capture cover was lost to optional economic search");
+        auto progress = manager.progress_context_transaction(program, {});
+        require(std::get<Manager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                        ContextTransactionStatus::Published &&
+                    program.started_action_ids.size() == 2,
+                "capture cover did not preserve and publish the two-owner target");
+        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                          999) == program.started_action_ids.end(),
+                "capture cover targeted the active request");
+        require(CountedCaptureClock::ticks - started < 50'000'000,
+                "capture cover exhausted the actual boundary allowance");
+        require(program.preserving_seed_calls == 1 &&
+                    program.preserving_seed_unknown_owner_ids == 0,
+                "capture construction included a protected/replacement owner or repeated its seed");
+        program.pressure_assessment_hook  = nullptr;
+        program.required_pressure_actions = 0;
+        (void)finish_active(manager, program, active);
+    }
+}
+
+void test_capture_construction_budget_and_null_seed() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract, CountedCaptureClock>;
+    for (const auto [budget, enabled] :
+         {std::pair{1U, true}, std::pair{2U, false}, std::pair{2U, true}}) {
+        CountedCaptureClock::ticks = 1'000'000'000;
+        FakeProgram program;
+        program.required_pressure_actions    = 2;
+        program.preserving_seed_enabled      = enabled;
+        program.pressure_action_immediate_ns = 0;
+        FakeCaptureAssessment capture{.shared_evidence =
+                                          ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                                      .protected_rebuild_work = PrefillWork{.tokens = 64},
+                                      .publishes_shared       = true,
+                                      .physically_feasible    = false};
+        const std::array<FakeContinuationHandle, 2> handles{FakeContinuationHandle{7, 0},
+                                                            FakeContinuationHandle{8, 0}};
+        const std::array<const FakeContinuationHandle*, 2> owners{&handles[0], &handles[1]};
+        const std::array ids{PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}};
+        const std::array policies{Planner::OwnerPolicy{.owner = ids[0]},
+                                  Planner::OwnerPolicy{.owner = ids[1]}};
+        const std::array checkpoints{
+            Planner::CheckpointPolicy{
+                .owner      = ids[0],
+                .checkpoint = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+                .rebuild_ns = 1000},
+            Planner::CheckpointPolicy{
+                .owner      = ids[1],
+                .checkpoint = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+                .rebuild_ns = 1000}};
+        const ninfer::runtime::PlanningAllowance allowance{.started_ns = CountedCaptureClock::ticks,
+                                                           .limit_ns   = 50'000'000};
+        ninfer::runtime::CaptureSearchControl search(allowance, 1'000'000'000,
+                                                     CountedCaptureClock::ticks);
+        Planner planner;
+        const auto result = planner.plan(program, test_cost_model(),
+                                         Planner::Input{.capture              = &capture,
+                                                        .private_owners       = owners,
+                                                        .private_owner_ids    = ids,
+                                                        .owner_policies       = policies,
+                                                        .checkpoint_policies  = checkpoints,
+                                                        .candidate_rebuild_ns = 1'000'000'000,
+                                                        .target_budget        = budget,
+                                                        .allow_deficit_seed   = true,
+                                                        .allowance            = allowance,
+                                                        .search               = &search});
+        require(bool(result) == (budget == 2 && enabled),
+                "capture construction adopted a null/unassessed cover");
+        require(program.preserving_seed_calls == unsigned(budget == 2),
+                "one-target capture budget invoked construction");
+        require(!search.stopped && search.stop != ninfer::runtime::CaptureSearchStop::Time,
+                "two-target discovery stopped other competitive capture scenarios");
+        require(search.targets_evaluated == (result ? 2U : 1U),
+                "capture seed assessment escaped the canonical budget");
+    }
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
-    FakeManager manager = make_manager(1, 4, 1);
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 4, 1, true, 2, test_cost_model());
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 41, make_base(41), 1);
     (void)finish_active(manager, program, first);
@@ -3982,10 +4400,10 @@ void test_shared_capture_combines_two_pressure_owners() {
 
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 7}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+    require(reserved == Manager::ActiveCaptureReserveResult::Reserved,
             "shared capture did not reserve a multi-owner pressure target");
     auto progress      = manager.progress_context_transaction(program, {});
-    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    const auto outcome = std::get<Manager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published &&
                 program.started_action_ids.size() == 2,
             "shared capture did not publish the selected two-owner target");
@@ -3998,7 +4416,8 @@ void test_shared_capture_combines_two_pressure_owners() {
 }
 
 void test_aborted_shared_capture_start_rolls_back_logical_claims() {
-    FakeManager manager = make_manager(1, 4, 1);
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 4, 1, true, 2, test_cost_model());
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 141, make_base(141), 1);
     (void)finish_active(manager, program, first);
@@ -4025,20 +4444,20 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
 
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 13}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped &&
+    require(reserved == Manager::ActiveCaptureReserveResult::Skipped &&
                 !manager.context_transaction_kind() && !program.has_context_transaction(),
             "aborted shared capture start retained transaction ownership");
-    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
-                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+    require(manager.catalog_state(0) == Manager::CatalogState::Catalogued &&
+                manager.catalog_state(1) == Manager::CatalogState::Catalogued,
             "aborted shared capture start leaked logical victim claims");
 
     program.abort_capture_start = false;
     const auto retried =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 14}, 0, {});
-    require(retried == FakeManager::ActiveCaptureReserveResult::Reserved,
+    require(retried == Manager::ActiveCaptureReserveResult::Reserved,
             "aborted shared capture start leaked the shared publication slot");
     auto progress      = manager.progress_context_transaction(program, {});
-    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    const auto outcome = std::get<Manager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published,
             "shared capture retry did not publish after rollback");
 
@@ -4047,7 +4466,8 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
 }
 
 void test_capture_result_is_validated_before_any_adoption() {
-    FakeManager manager = make_manager(1, 4, 1);
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 4, 1, true, 2, test_cost_model());
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 241, make_base(241), 1);
     (void)finish_active(manager, program, first);
@@ -4073,10 +4493,10 @@ void test_capture_result_is_validated_before_any_adoption() {
     program.malform_last_capture_private_victim = true;
 
     require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 17}, 0,
-                                           {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                                           {}) == Manager::ActiveCaptureReserveResult::Reserved,
             "malformed capture fixture could not reserve pressure");
-    require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed &&
-                manager.catalog_state(1) == FakeManager::CatalogState::Claimed,
+    require(manager.catalog_state(0) == Manager::CatalogState::Claimed &&
+                manager.catalog_state(1) == Manager::CatalogState::Claimed,
             "malformed capture fixture did not claim both owners");
 
     bool rejected = false;
@@ -4084,13 +4504,14 @@ void test_capture_result_is_validated_before_any_adoption() {
         (void)manager.progress_context_transaction(program, {});
     } catch (const std::logic_error&) { rejected = true; }
     require(rejected, "malformed capture result was accepted");
-    require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed &&
-                manager.catalog_state(1) == FakeManager::CatalogState::Claimed,
+    require(manager.catalog_state(0) == Manager::CatalogState::Claimed &&
+                manager.catalog_state(1) == Manager::CatalogState::Claimed,
             "malformed capture result partially adopted an earlier victim");
 }
 
 void test_capture_result_is_adopted_by_owner_identity() {
-    FakeManager manager = make_manager(1, 4, 1);
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 4, 1, true, 2, test_cost_model());
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 251, make_base(251), 1);
     (void)finish_active(manager, program, first);
@@ -4116,13 +4537,13 @@ void test_capture_result_is_adopted_by_owner_identity() {
     };
 
     require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 27}, 0,
-                                           {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                                           {}) == Manager::ActiveCaptureReserveResult::Reserved,
             "reordered capture fixture could not reserve pressure");
     auto progress      = manager.progress_context_transaction(program, {});
-    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    const auto outcome = std::get<Manager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published &&
-                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
-                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+                manager.catalog_state(0) == Manager::CatalogState::Catalogued &&
+                manager.catalog_state(1) == Manager::CatalogState::Catalogued,
             "reordered capture results changed victim availability");
     program.required_pressure_actions = 0;
     (void)finish_active(manager, program, active);
@@ -4521,6 +4942,16 @@ int main() {
              test_portfolio_dense_sparse_and_shuffled_ids_against_integer_oracle);
     run_test("shared capture private transition loss",
              test_shared_capture_subtracts_private_transition_loss);
+    run_test("fitting shared capture avoids pressure",
+             test_fitting_shared_capture_does_not_search_pressure);
+    run_test("capture bound exhaustive and alias recovery",
+             test_shared_capture_bounds_allow_cheaper_survivors);
+    run_test("capture shared economic cancellation budget",
+             test_shared_capture_search_is_one_cancellable_economic_budget);
+    run_test("capture rank bounds and economic probe ordering",
+             test_capture_rank_bounds_and_probe_order);
+    run_test("shared capture elapsed boundary budget",
+             test_shared_capture_obeys_boundary_time_budget);
     run_test("shared capture committed target budget",
              test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
@@ -4572,6 +5003,10 @@ int main() {
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("shared capture cover before economic stop",
+             test_shared_capture_constructs_cover_before_economic_stop);
+    run_test("capture construction discovery budget and null seed",
+             test_capture_construction_budget_and_null_seed);
     run_test("test_dormant_shared_prior_allows_a_more_valuable_replacement",
              test_dormant_shared_prior_allows_a_more_valuable_replacement);
     run_test("test_shared_replacement_lifecycle_accounts_for_both_ids",

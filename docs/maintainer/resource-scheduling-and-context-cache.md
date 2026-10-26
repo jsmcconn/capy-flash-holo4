@@ -882,7 +882,11 @@ exhausted. Time is checked between Program operations, and estimation error can 
 to overrun; the final seal must still complete. The budget therefore affects only cache quality; it
 does not change mandatory readiness, nor does it promise that the whole planning call can be
 interrupted at any moment.
-Shared capture keeps its own independent fixed target budget and Skip incumbent.
+Shared capture keeps the Skip incumbent. All replacement scenarios for a capture share a
+4,096-assessment limit and the same `PlanningAllowance`. Search ranks scenarios by optimistic net
+gain and stable ordinal, checks identities before expansion, and prunes a scenario only when its
+upper bound cannot beat the incumbent, including the tie-breaks. Cancellation skips optional
+captures that have yet to start. The Program still owns feasibility, sealing and adoption.
 
 ### 8.8 Objective function and determinism
 
