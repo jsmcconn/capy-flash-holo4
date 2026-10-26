@@ -65,6 +65,8 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
 
 void set_bytes(const ninfer::Tensor& tensor, unsigned char value) {
     CUDA_CHECK(cudaMemset(tensor.data, value, tensor.bytes()));
+    // cudaMemset uses the default stream; the pool exercises nonblocking streams.
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
 void expect_bytes(const ninfer::Tensor& tensor, unsigned char expected, std::string_view label) {
