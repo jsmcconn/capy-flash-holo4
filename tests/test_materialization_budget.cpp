@@ -32,6 +32,33 @@ int main() {
         require(discovery.allow(10 * ms, ms, ms, 70'000 * ms, true, 2),
                 "complete prediction could not continue after discovery");
 
+        MaterializationSearchBudget recovery(idle, 0, 80'000 * ms, true);
+        require(recovery.allow(5 * ms, ms, 16 * ms, 70'000 * ms, false, 0),
+                "maximal fallback recovery lost its sole bounded discovery episode");
+        require(recovery.granted_ns() == idle.limit_ns &&
+                    recovery.allow(40 * ms, ms, ms, 70'000 * ms, false, 0),
+                "fallback discovery stopped at 10ms despite a live solo allowance");
+        require(!recovery.allow(idle.limit_ns, 1, 1, 70'000 * ms, false, 0),
+                "fallback recovery exceeded its shared boundary");
+        MaterializationSearchBudget with_completion(idle, 0, 80'000 * ms, true, 2 * ms);
+        require(with_completion.allow(5 * ms, ms, ms, 70'000 * ms, false, 0) &&
+                    with_completion.granted_ns() == idle.limit_ns - 2 * ms,
+                "optional discovery consumed the measured mandatory completion reserve");
+        require(!with_completion.allow(48 * ms, ms, ms, 70'000 * ms, true, 1),
+                "optional work extended into the final assessment and sealing reserve");
+        const auto completed_boundary = with_completion.granted_ns() + 2 * ms;
+        require(completed_boundary == idle.limit_ns,
+                "gross optional-plus-mandatory completion accounting exceeded its boundary");
+        MaterializationSearchBudget completion_only(idle, 0, 80'000 * ms, true, 60 * ms);
+        require(completion_only.granted_ns() == 0 &&
+                    !completion_only.allow(0, 1, 1, 70'000 * ms, true, 1),
+                "completion reserve larger than the allowance underflowed optional time");
+        auto foreground = PlanningAllowance::boundary(1, 0);
+        MaterializationSearchBudget foreground_recovery(foreground, 0, 80'000 * ms, true);
+        require(foreground_recovery.allow(5 * ms, ms, ms, 70'000 * ms, false, 0) &&
+                    foreground_recovery.granted_ns() == 10 * ms,
+                "fallback discovery extended a busy boundary past 10ms");
+
         auto busy = PlanningAllowance::boundary(2, 0);
         MaterializationSearchBudget first(busy, busy.limit_ns - 4 * ms, 80'000 * ms);
         require(first.granted_ns() == 4 * ms, "mandatory work did not consume boundary time");

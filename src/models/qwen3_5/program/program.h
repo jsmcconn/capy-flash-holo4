@@ -613,6 +613,13 @@ public:
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // Bounded Device demotions and cost-ordered Host eviction cover. Exact assess/seal
+    // still decide feasibility; protected sources and an all-owner target are excluded.
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    deficit_cover_target(runtime::PlanningCandidateId candidate,
+                         std::span<const runtime::PlanningOwnerId> owner_order,
+                         bool evict_private_for_publication, std::uint64_t budget_ns,
+                         MaterializationSeedDiagnostics& diagnostics);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -660,6 +667,9 @@ public:
     CapturePressurePlanningSession& operator=(const CapturePressurePlanningSession&) = delete;
 
     [[nodiscard]] PressureTargetHandle identity_target() const;
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    deficit_cover_target(std::span<const runtime::PlanningOwnerId> owner_order,
+                         std::uint64_t budget_ns, MaterializationSeedDiagnostics& diagnostics);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion prepare_expansion(PressureTargetHandle parent);

@@ -48,10 +48,17 @@ struct PlanningAllowance {
 class MaterializationSearchBudget {
 public:
     MaterializationSearchBudget(PlanningAllowance allowance, std::uint64_t started,
-                                std::uint64_t initial_cost) noexcept
+                                std::uint64_t initial_cost,
+                                bool recovering_maximal_fallback    = false,
+                                std::uint64_t completion_reserve_ns = 0) noexcept
         : allowance_(allowance), started_(started),
-          granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+          recovering_maximal_fallback_(recovering_maximal_fallback) {
+        // Mandatory exact assessment/sealing still runs after optional work. Its
+        // observed estimate reduces the optional ceiling, never feasibility.
+        allowance_.limit_ns -= std::min(allowance_.limit_ns, completion_reserve_ns);
+        granted_ = std::min(
+            {std::uint64_t{5'000'000}, economic(initial_cost), allowance_.remaining(started)});
+    }
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,
@@ -84,7 +91,13 @@ public:
         const auto hard = elapsed + remaining; // bounded by the allowance's representable duration
         const auto growth = std::max(granted_, next_operation_ns);
         auto added        = std::min(growth, hard > granted_ ? hard - granted_ : 0);
-        if (!complete_prediction) { added = std::min<std::uint64_t>(added, 5'000'000); }
+        if (!complete_prediction) {
+            // With no ordinary feasible seed, a truncated search otherwise adopts the
+            // all-owner eviction fallback. Permit one discovery episode up to the existing
+            // boundary to find a source-preserving target; ordinary searches retain 5 ms.
+            added = recovering_maximal_fallback_ ? (hard > granted_ ? hard - granted_ : 0)
+                                                 : std::min<std::uint64_t>(added, 5'000'000);
+        }
         if (added == 0 || elapsed + next_operation_ns > granted_ + added) {
             reason_ = MaterializationStopReason::TimeBudget;
             return false;
@@ -120,6 +133,7 @@ private:
     bool boundary_limited_ = false;
     PlanningAllowance allowance_;
     std::uint64_t started_            = 0;
+    bool recovering_maximal_fallback_ = false;
     std::uint64_t granted_            = 0;
     std::uint64_t renewal_progress_   = 0;
     std::uint32_t renewals_           = 0;

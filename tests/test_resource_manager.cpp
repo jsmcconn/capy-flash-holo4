@@ -563,6 +563,18 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    deficit_cover_target(PlanningCandidateId candidate,
+                         std::span<const PlanningOwnerId> owner_order,
+                         bool evict_private_for_publication, std::uint64_t budget_ns,
+                         ninfer::MaterializationSeedDiagnostics& diagnostics);
+
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    deficit_cover_target(std::span<const PlanningOwnerId> owner_order, std::uint64_t budget_ns,
+                         ninfer::MaterializationSeedDiagnostics& diagnostics) {
+        return deficit_cover_target(candidate_id(), owner_order, false, budget_ns, diagnostics);
+    }
+
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -1174,6 +1186,9 @@ public:
     std::optional<std::size_t> pressure_optional_target_capacity;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
     std::uint32_t pressure_action_degradation_units = 1;
+    bool preserving_seed_enabled                    = false;
+    std::uint32_t preserving_seed_calls             = 0;
+    std::uint32_t preserving_seed_unknown_owner_ids = 0;
     bool include_cumulative_private_target          = false;
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
@@ -1416,6 +1431,77 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
     const auto target                   = root_maximal_target(candidate);
     targets_[target.index].root_maximal = false;
     return target;
+}
+
+std::optional<FakePressureTargetHandle> FakePressurePlanningSession::deficit_cover_target(
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> owner_order,
+    bool evict_private_for_publication, std::uint64_t,
+    ninfer::MaterializationSeedDiagnostics& diagnostics) {
+    diagnostics = {};
+    ++program_->preserving_seed_calls;
+    if (!program_->preserving_seed_enabled) return std::nullopt;
+    const auto selected = candidate_index(candidate);
+    populate_options(selected);
+    Target target{.candidate_index = selected,
+                  .choices         = std::vector<std::uint16_t>(owners_.size(), 0)};
+    const auto find_owner = [&](PlanningOwnerId id) {
+        const auto found =
+            std::find_if(owners_.begin(), owners_.end(), [&](const auto& o) { return o.id == id; });
+        return static_cast<std::size_t>(found - owners_.begin());
+    };
+    for (auto owner : owner_order) {
+        if (find_owner(owner) == owners_.size()) { ++program_->preserving_seed_unknown_owner_ids; }
+    }
+    if (evict_private_for_publication) {
+        bool released = false;
+        for (auto id : owner_order) {
+            auto index = find_owner(id);
+            if (index == owners_.size() || owners_[index].shared) continue;
+            const auto& alternatives = options_[selected][index];
+            auto eviction            = std::find_if(alternatives.begin(), alternatives.end(),
+                                                    [](const auto& d) { return d.evicts_continuation; });
+            if (eviction == alternatives.end()) continue;
+            target.choices[index] =
+                static_cast<std::uint16_t>(1U + eviction - alternatives.begin());
+            released = true;
+            break;
+        }
+        if (!released) return std::nullopt;
+    }
+    const auto units = [&] {
+        std::vector<FakeTargetDecision> decisions;
+        for (std::size_t i = 0; i < owners_.size(); ++i)
+            if (target.choices[i])
+                decisions.push_back(options_[selected][i][target.choices[i] - 1U]);
+        return program_->pressure_units(decisions);
+    };
+    for (auto id : owner_order) {
+        if (units() >= program_->required_pressure_actions) break;
+        const auto index = find_owner(id);
+        if (index == owners_.size() || target.choices[index]) continue;
+        const auto& alternatives = options_[selected][index];
+        const auto preserving =
+            std::find_if(alternatives.begin(), alternatives.end(), [](const auto& d) {
+                return !d.evicts_continuation && d.dropped_checkpoints == 0;
+            });
+        if (preserving != alternatives.end())
+            target.choices[index] =
+                static_cast<std::uint16_t>(1U + preserving - alternatives.begin());
+    }
+    if (units() < program_->required_pressure_actions) return std::nullopt;
+    auto found = std::find_if(targets_.begin(), targets_.end(),
+                              [&](const auto& t) { return same_target(t, target); });
+    if (found != targets_.end())
+        return FakePressureTargetHandle{.generation = generation_,
+                                        .index =
+                                            static_cast<std::uint32_t>(found - targets_.begin())};
+    if (targets_.size() >= candidates_.size() + 1U + 4096U) return std::nullopt;
+    target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+    targets_.push_back(std::move(target));
+    program_->pressure_target_count_peak =
+        std::max(program_->pressure_target_count_peak, targets_.size());
+    return FakePressureTargetHandle{.generation = generation_,
+                                    .index      = static_cast<std::uint32_t>(targets_.size() - 1U)};
 }
 
 FakePressurePlanningSession::Cursor
@@ -2732,37 +2818,61 @@ void test_uncommitted_pressure_acknowledgement_is_not_degradation() {
 }
 
 void test_aborted_source_selection_does_not_create_hit_history() {
-    FakeManager manager = make_manager(1, 3);
-    FakeProgram program;
-    const ActiveRequest first = start_active(manager, program, 61, make_base(61), 1);
-    (void)finish_active(manager, program, first);
-    const ActiveRequest second = start_active(manager, program, 62, make_base(62), 2);
-    (void)finish_active(manager, program, second);
-
-    auto reuse = manager.inspect(program, FakePreparedPrompt{61}, make_base(61), 3);
-    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
-            "cancelled-hit test did not select its exact source");
-    program.abort_progress = true;
-    require(manager.reserve_materialization(program, std::move(*reuse.choice),
-                                            FakePreparedPrompt{61}, {}) ==
-                FakeManager::MaterializationReserveResult::Reserved,
-            "cancelled-hit test could not reserve exact reuse");
-    auto progress = manager.progress_context_transaction(program, {});
-    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
-    require(outcome.status == ContextTransactionStatus::Aborted,
-            "cancelled-hit test unexpectedly published its request");
-
-    program.abort_progress            = false;
-    program.required_pressure_actions = 1;
-    program.require_evictions         = true;
-    auto pressure = manager.inspect(program, FakePreparedPrompt{63}, make_base(63), 4);
-    require(pressure.choice.has_value(), "cancelled-hit test could not plan pressure");
-    program.abort_start = true;
-    (void)manager.reserve_materialization(program, std::move(*pressure.choice),
-                                          FakePreparedPrompt{63}, {});
-    require(program.started_action_ids.size() == 1 &&
-                program.started_action_ids.front() == 2000U + first.sequence.id,
-            "aborted source selection incorrectly biased later retention policy");
+    // A tied victim can depend on search order. Test both possible aborted sources, so a
+    // spurious hit cannot hide behind the no-hit control's chosen victim. The successful-hit
+    // arm checks that the fixture actually responds to observed reuse.
+    const auto victim = [](std::optional<unsigned> reused, bool abort) {
+        FakeManager manager = make_manager(1, 3);
+        FakeProgram program;
+        std::array<std::uint32_t, 2> ids{};
+        for (unsigned index = 0; index < ids.size(); ++index) {
+            const auto active =
+                start_active(manager, program, 61 + index, make_base(61 + index), index + 1);
+            ids[index] = active.sequence.id;
+            (void)finish_active(manager, program, active);
+        }
+        if (reused && abort) {
+            const auto key = 61 + *reused;
+            auto reuse     = manager.inspect(program, FakePreparedPrompt{key}, make_base(key), 3);
+            require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+                    "cancelled-hit test did not select its exact source");
+            program.abort_progress = true;
+            require(manager.reserve_materialization(program, std::move(*reuse.choice),
+                                                    FakePreparedPrompt{key}, {}) ==
+                        FakeManager::MaterializationReserveResult::Reserved,
+                    "cancelled-hit test could not reserve exact reuse");
+            auto progress = manager.progress_context_transaction(program, {});
+            auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            require(outcome.status == ContextTransactionStatus::Aborted,
+                    "cancelled-hit test unexpectedly published its request");
+            program.abort_progress = false;
+        } else if (reused) {
+            const auto key    = 61 + *reused;
+            const auto active = start_active(manager, program, key, make_base(key), 3);
+            ids[*reused]      = active.sequence.id;
+            (void)finish_active(manager, program, active);
+        }
+        program.required_pressure_actions = 1;
+        program.require_evictions         = true;
+        auto pressure = manager.inspect(program, FakePreparedPrompt{63}, make_base(63), 4);
+        require(pressure.choice.has_value(), "cancelled-hit test could not plan pressure");
+        program.abort_start = true;
+        (void)manager.reserve_materialization(program, std::move(*pressure.choice),
+                                              FakePreparedPrompt{63}, {});
+        require(program.started_action_ids.size() == 1,
+                "cancelled-hit fixture did not select exactly one eviction");
+        const auto selected =
+            std::find(ids.begin(), ids.end(), program.started_action_ids[0] - 2000U);
+        require(selected != ids.end(), "cancelled-hit fixture evicted an unknown owner");
+        return static_cast<unsigned>(selected - ids.begin());
+    };
+    const auto control = victim(std::nullopt, false);
+    for (unsigned source : {0U, 1U}) {
+        require(victim(source, true) == control,
+                "aborted source selection incorrectly biased later retention policy");
+    }
+    require(victim(control, false) != control,
+            "cancelled-hit fixture did not respond to a successfully published reuse");
 }
 
 void test_retained_source_is_protected_until_terminal() {
@@ -3841,7 +3951,9 @@ void test_complete_search_against_small_exhaustive_oracle() {
     const std::array<std::uint64_t, 3> rebuild{600 * ms, 200 * ms, 100 * ms};
     const std::array<std::uint64_t, 3> spill{40 * ms, 200 * ms, 10 * ms};
     const std::array<std::uint64_t, 3> drop{ms, 2 * ms, 3 * ms};
-    for (unsigned weight_rotation = 0; weight_rotation < 3; ++weight_rotation) {
+    for (unsigned variant = 0; variant < 6; ++variant) {
+        const bool root_only           = variant >= 3;
+        const unsigned weight_rotation = variant % 3;
         for (unsigned required = 0; required <= 3; ++required) {
             for (bool full_catalog : {false, true}) {
                 FakeProgram program;
@@ -3890,6 +4002,8 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     Planner::CandidateInput{.candidate = &root, .id = {.value = 0}},
                     Planner::CandidateInput{
                         .candidate = &reuse, .id = {.value = 1}, .stable_ordinal = 1}};
+                const auto candidate_inputs = std::span<const Planner::CandidateInput>(candidates)
+                                                  .first(root_only ? 1U : candidates.size());
                 const auto inputs = [&]() -> Planner::PressureInputs {
                     return {.private_owners    = owners,
                             .private_owner_ids = ids,
@@ -3909,7 +4023,7 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     return std::nullopt;
                 };
                 std::uint64_t oracle = UINT64_MAX;
-                for (unsigned source = 0; source < 2; ++source) {
+                for (unsigned source = 0; source < (root_only ? 1U : 2U); ++source) {
                     for (unsigned raw = 0; raw < 27; ++raw) {
                         unsigned digits = raw, relief = 0;
                         bool frees_slot = false, protects_source = true;
@@ -3944,13 +4058,14 @@ void test_complete_search_against_small_exhaustive_oracle() {
                 auto allowance     = ninfer::runtime::PlanningAllowance::boundary(0);
                 allowance.limit_ns = 5 * ms;
                 auto result =
-                    planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                                 inputs, goal, Planner::Clock::now(), allowance);
+                    planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidate_inputs,
+                                 0, inputs, goal, Planner::Clock::now(), allowance);
                 require(result && result->plan,
                         "exhaustive-oracle problem lost its feasible fallback");
                 if (result->diagnostics.predicted_total_ns != oracle) {
-                    std::cerr << "oracle rotation=" << weight_rotation << " relief=" << required
-                              << " full=" << full_catalog << " expected=" << oracle
+                    std::cerr << "oracle root_only=" << root_only << " rotation=" << weight_rotation
+                              << " relief=" << required << " full=" << full_catalog
+                              << " expected=" << oracle
                               << " selected=" << result->diagnostics.predicted_total_ns << '\n';
                 }
                 require(result->diagnostics.predicted_total_ns == oracle,
@@ -3962,6 +4077,86 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     "construction included the selected source as a victim");
             }
         }
+    }
+}
+
+void test_preserving_seed_retains_histories_without_optional_search() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+    for (bool release_private : {false, true}) {
+        FakeProgram program;
+        program.preserving_seed_enabled         = true;
+        program.pressure_checkpoint_recovery_ns = 1000000000;
+        program.required_pressure_actions       = 8;
+        std::array<FakeContinuationHandle, 16> handles;
+        std::array<const FakeContinuationHandle*, 16> owners;
+        std::array<PlanningOwnerId, 16> ids;
+        std::array<ninfer::runtime::MaterializationOwnerPolicy, 16> policies;
+        std::array<ninfer::runtime::MaterializationCheckpointPolicy, 16> checkpoints;
+        for (unsigned i = 0; i < 16; ++i) {
+            handles[i]     = FakeContinuationHandle{i + 1, 0};
+            owners[i]      = &handles[i];
+            ids[i]         = {.value = i};
+            policies[i]    = {.owner = ids[i], .private_retention_weight = 4};
+            checkpoints[i] = {
+                .owner      = ids[i],
+                .checkpoint = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+                .rebuild_ns = 1000000000};
+            program.owner_decisions.push_back({i + 1,
+                                               {{.id = 1000 + i, .immediate_ns = 1000},
+                                                {.id                  = 2000 + i,
+                                                 .immediate_ns        = 0,
+                                                 .degradation_units   = 2,
+                                                 .dropped_checkpoints = 1,
+                                                 .evicts_continuation = true}}});
+        }
+        FakeAdmissionCandidate root, reuse;
+        set_fake_machine_costs(root.identity.machine_work, 8000000000ULL, 8000000000ULL);
+        set_fake_machine_costs(reuse.identity.machine_work, 100000000, 100000000);
+        reuse.private_source_id                          = 1;
+        reuse.value.reusable_prompt_tokens               = 55048;
+        reuse.identity.machine_work.reused_prompt_tokens = 55048;
+        for (auto* c : {&root, &reuse}) {
+            c->identity.physical_status =
+                ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+            c->identity.expandable = true;
+        }
+        const std::array candidates{
+            Planner::CandidateInput{.candidate = &root, .id = {.value = 0}},
+            Planner::CandidateInput{.candidate = &reuse, .id = {.value = 1}, .stable_ordinal = 1}};
+        const auto inputs = [&]() -> Planner::PressureInputs {
+            return {.private_owners    = owners,
+                    .private_owner_ids = ids,
+                    .owner_policy      = policies,
+                    .checkpoint_policy = checkpoints};
+        };
+        const auto goal = [&](PlanningCandidateId, PrivateSourceMode,
+                              std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+            -> std::optional<Planner::LogicalGoal> {
+            if (!release_private ||
+                std::any_of(outcomes.begin(), outcomes.end(), [](const auto& o) {
+                    return o.disposition == VictimDisposition::Evicted;
+                }))
+                return Planner::LogicalGoal{.publication_slot = 0};
+            return std::nullopt;
+        };
+        Planner planner;
+        auto allowance     = ninfer::runtime::PlanningAllowance::boundary(0);
+        allowance.limit_ns = 0;
+        auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                                   inputs, goal, Planner::Clock::now(), allowance);
+        require(result && result->plan && result->candidate.value == 1 &&
+                    !result->diagnostics.selected_maximal_fallback,
+                "zero optional budget discarded histories instead of adopting a preserving seed");
+        require(result->plan->private_actions.size() == 8 &&
+                    std::count_if(result->plan->private_actions.begin(),
+                                  result->plan->private_actions.end(),
+                                  [](const auto& d) { return d.evicts_continuation; }) ==
+                        (release_private ? 1 : 0),
+                "preserving seed did not limit eviction to the required private publication slot");
+        require(std::find(result->plan->private_owner_ids.begin(),
+                          result->plan->private_owner_ids.end(),
+                          1U) == result->plan->private_owner_ids.end(),
+                "preserving seed changed its selected source owner");
     }
 }
 
@@ -4000,6 +4195,8 @@ int main() {
              test_hostless_private_capture_reclaim_never_pays_more_than_it_protects);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
+    run_test("preserving mandatory seed with zero optional budget",
+             test_preserving_seed_retains_histories_without_optional_search);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
     run_test("private checkpoint identity loss",

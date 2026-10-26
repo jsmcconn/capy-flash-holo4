@@ -1603,6 +1603,11 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
+    deficit_cover_target(runtime::PlanningCandidateId candidate,
+                         std::span<const runtime::PlanningOwnerId> owner_order,
+                         bool evict_private_for_publication, std::uint64_t budget_ns,
+                         MaterializationSeedDiagnostics& diagnostics);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep

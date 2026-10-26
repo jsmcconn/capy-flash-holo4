@@ -92,8 +92,13 @@ materialization_machine_work(const ResourceCandidateState& candidate,
         }
     }
 
+    auto pressure_work = pressure.work;
+    auto& d2h =
+        pressure_work[planning_direction_index(runtime::ContextTransferDirection::DeviceToHost)];
+    d2h.copy_operations = planning_saturating_u32(static_cast<std::uint64_t>(d2h.copy_operations) +
+                                                  candidate.pressure_fragment_copy_operations);
     return runtime::MaterializationMachineWork{
-        .pressure_transfers             = pressure.work,
+        .pressure_transfers             = pressure_work,
         .candidate_transfers            = request.work,
         .optimistic_candidate_transfers = optimistic_request.work,
         .remaining_prefill_work         = candidate.remaining_prefill_work,

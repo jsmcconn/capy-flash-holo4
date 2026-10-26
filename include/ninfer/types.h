@@ -1048,6 +1048,11 @@ materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
     return "none";
 }
 
+struct MaterializationSeedDiagnostics {
+    std::uint32_t physical_probes = 0;
+    std::uint32_t evicted_owners  = 0;
+};
+
 struct MaterializationDiagnostics {
     std::uint64_t predicted_now_ns           = 0;
     std::uint64_t predicted_future_loss_ns   = 0;
@@ -1071,6 +1076,12 @@ struct MaterializationDiagnostics {
     std::uint64_t search_overshoot_ns            = 0;
     MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
     bool search_boundary_limited                 = false;
+    bool started_from_maximal                    = false;
+    bool host_seed_found                         = false;
+    std::uint32_t deficit_cover_probes           = 0;
+    std::uint32_t deficit_cover_evictions        = 0;
+    std::uint64_t deficit_cover_elapsed_ns       = 0;
+    std::uint64_t pre_search_elapsed_ns          = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
