@@ -20,7 +20,7 @@ namespace ninfer::runtime {
 
 // Shared publication is optional. Unlike materialization, its incumbent is always Skip and a
 // target is selectable only when the complete post-state has strictly positive net value.
-template <class ModelContract>
+template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class SharedCapturePlanner {
 public:
     using Program                = typename ModelContract::Program;

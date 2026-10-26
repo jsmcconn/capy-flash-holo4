@@ -822,6 +822,9 @@ public:
             FakeActiveCaptureResult result;
             result.status =
                 cancellation.requested() ? ContextTransactionStatus::Aborted : capture_status;
+            result.capacity_preparation_committed =
+                result.status == ContextTransactionStatus::Published &&
+                pending_capture_replaces_shared_;
             if (pending_plan_) {
                 for (std::size_t index = 0; index < pending_plan_->private_actions.size();
                      ++index) {
@@ -984,7 +987,8 @@ public:
     void finalize_context_transaction() noexcept {
         transaction_kind_ = TransactionKind::None;
         pending_plan_.reset();
-        pending_capture_publish_shared_ = false;
+        pending_capture_publish_shared_  = false;
+        pending_capture_replaces_shared_ = false;
     }
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
@@ -1060,22 +1064,23 @@ public:
 
     [[nodiscard]] ContextTransactionReserveStatus
     reserve_active_capture(FakeCaptureOffer&&, const FakeSharedPrefixHandle*,
-                           const FakeSharedPrefixHandle*, std::optional<CheckpointRef>, bool,
-                           CancellationFlagView cancellation) {
+                           const FakeSharedPrefixHandle* replaced_shared,
+                           std::optional<CheckpointRef>, bool, CancellationFlagView cancellation) {
         if (cancellation.requested() || abort_capture_start) {
             return ContextTransactionReserveStatus::Aborted;
         }
         pending_plan_.reset();
-        pending_capture_publish_shared_ = false;
-        transaction_kind_               = TransactionKind::Capture;
+        pending_capture_publish_shared_  = false;
+        pending_capture_replaces_shared_ = replaced_shared != nullptr;
+        transaction_kind_                = TransactionKind::Capture;
         advance_revision();
         return ContextTransactionReserveStatus::Reserved;
     }
 
     [[nodiscard]] ContextTransactionReserveStatus reserve_active_capture_with_pressure(
-        FakeCaptureOffer&&, const FakeSharedPrefixHandle*, const FakeSharedPrefixHandle*,
-        std::optional<CheckpointRef>, bool publish_shared, FakeResourcePlan&& pressure,
-        CancellationFlagView cancellation) {
+        FakeCaptureOffer&&, const FakeSharedPrefixHandle*,
+        const FakeSharedPrefixHandle* replaced_shared, std::optional<CheckpointRef>,
+        bool publish_shared, FakeResourcePlan&& pressure, CancellationFlagView cancellation) {
         if (cancellation.requested() || abort_capture_start || pressure.revision != revision_) {
             return ContextTransactionReserveStatus::Aborted;
         }
@@ -1087,8 +1092,9 @@ public:
             started_action_ids.push_back(action.id);
         }
         pending_plan_.emplace(std::move(pressure));
-        pending_capture_publish_shared_ = publish_shared;
-        transaction_kind_               = TransactionKind::Capture;
+        pending_capture_publish_shared_  = publish_shared;
+        pending_capture_replaces_shared_ = replaced_shared != nullptr;
+        transaction_kind_                = TransactionKind::Capture;
         advance_revision();
         return ContextTransactionReserveStatus::Reserved;
     }
@@ -1238,7 +1244,8 @@ private:
     FakePreparedPrompt pending_prompt_;
     std::optional<FakeResourcePlan> pending_plan_;
     std::unique_ptr<FakeAdmissionCandidate> capture_pressure_candidate_;
-    bool pending_capture_publish_shared_ = false;
+    bool pending_capture_publish_shared_  = false;
+    bool pending_capture_replaces_shared_ = false;
 };
 
 FakePressurePlanningSession::FakePressurePlanningSession(
@@ -1867,7 +1874,8 @@ struct ActiveRequest {
     FakeSequenceHandle sequence;
 };
 
-ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint32_t content_key,
+template <class Manager>
+ActiveRequest start_active(Manager& manager, FakeProgram& program, std::uint32_t content_key,
                            const FakeRequestBasePlan& base, std::uint64_t publication_order) {
     auto inspection =
         manager.inspect(program, FakePreparedPrompt{content_key}, base, publication_order);
@@ -1875,15 +1883,15 @@ ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint
     const LaneId lane   = inspection.choice->destination();
     const auto reserved = manager.reserve_materialization(program, std::move(*inspection.choice),
                                                           FakePreparedPrompt{content_key}, {});
-    require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+    require(reserved == Manager::MaterializationReserveResult::Reserved,
             "request materialization was not reserved");
-    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+    auto outcome = [&]() -> typename Manager::MaterializationOutcome {
         auto progress = manager.progress_context_transaction(program, {});
         if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
-            return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            return std::get<typename Manager::MaterializationOutcome>(std::move(progress));
         }
         auto completed = manager.progress_context_transaction(program, {});
-        return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        return std::get<typename Manager::MaterializationOutcome>(std::move(completed));
     }();
     require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
             "request materialization did not publish");
@@ -2520,7 +2528,8 @@ void test_dominating_identity_does_not_build_pressure_graph() {
             "dominating identity eagerly constructed the pressure graph");
 }
 
-FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
+template <class Manager>
+FakeFinishResult finish_active(Manager& manager, FakeProgram& program, ActiveRequest request,
                                std::uint32_t frontier = 16) {
     program.finish_frontier = frontier;
     manager.mark_terminal_pending(request.lane);
@@ -3372,6 +3381,161 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
+struct FrozenCaptureClock {
+    using duration                  = std::chrono::nanoseconds;
+    using rep                       = duration::rep;
+    using period                    = duration::period;
+    using time_point                = std::chrono::time_point<FrozenCaptureClock>;
+    static constexpr bool is_steady = true;
+
+    static time_point now() noexcept { return time_point(duration(1'000'000'000)); }
+};
+
+void test_dormant_shared_checkpoint_keeps_rebuild_prior_after_credit_expires() {
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 3, 1, true, 2, test_cost_model(), false, true);
+    FakeProgram program;
+    auto seed_base = make_base(901);
+    seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const auto seed            = start_active(manager, program, 901, seed_base, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 901, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 901}, 0,
+                                           {}) == Manager::ActiveCaptureReserveResult::Reserved,
+            "dormant shared fixture could not publish its source");
+    auto progress = manager.progress_context_transaction(program, {});
+    require(std::get<Manager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                ContextTransactionStatus::Published,
+            "dormant shared fixture did not publish");
+    (void)finish_active(manager, program, seed);
+    // More than the complete demand/explicit-credit window, without matching the old key.
+    for (unsigned index = 0; index < 33; ++index) {
+        const auto key  = 1000U + index;
+        const auto side = start_active(manager, program, key, make_base(key), 2U + index);
+        (void)finish_active(manager, program, side);
+    }
+    const auto fresh           = start_active(manager, program, 902, make_base(902), 100);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 902, .frontier = 12},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 12},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, fresh.lane, FakeCaptureOffer{.id = 902}, 0,
+                                           {}) == Manager::ActiveCaptureReserveResult::Skipped,
+            "expired credit made a costly shared checkpoint free to replace with a cheaper one");
+    (void)finish_active(manager, program, fresh);
+    auto reuse = manager.inspect(program, FakePreparedPrompt{901}, make_base(901), 101);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 64,
+            "dormant shared checkpoint was lost after the demand window elapsed");
+}
+
+void test_dormant_shared_prior_allows_a_more_valuable_replacement() {
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 3, 1, true, 2, test_cost_model(), false, true);
+    FakeProgram program;
+    auto seed_base = make_base(901);
+    seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 12,
+    });
+    const auto seed            = start_active(manager, program, 901, seed_base, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 901, .frontier = 12},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 12},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 901}, 0,
+                                           {}) == Manager::ActiveCaptureReserveResult::Reserved,
+            "dormant shared fixture could not publish its source");
+    auto progress = manager.progress_context_transaction(program, {});
+    require(std::get<Manager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                ContextTransactionStatus::Published,
+            "dormant shared fixture did not publish");
+    (void)finish_active(manager, program, seed);
+    // More than the complete demand/explicit-credit window, without matching the old key.
+    for (unsigned index = 0; index < 33; ++index) {
+        const auto key  = 1000U + index;
+        const auto side = start_active(manager, program, key, make_base(key), 2U + index);
+        (void)finish_active(manager, program, side);
+    }
+    const auto fresh           = start_active(manager, program, 902, make_base(902), 100);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 902, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, fresh.lane, FakeCaptureOffer{.id = 902}, 0,
+                                           {}) == Manager::ActiveCaptureReserveResult::Reserved,
+            "dormant prior froze the catalog against a more valuable replacement");
+    auto replaced = manager.progress_context_transaction(program, {});
+    require(std::get<Manager::ActiveCaptureOutcome>(std::move(replaced)).status ==
+                ContextTransactionStatus::Published,
+            "more valuable replacement failed to publish");
+    // Leave the Shared source as the only reuse route, avoiding the cheaper private Move.
+    program.finish_release = true;
+    (void)finish_active(manager, program, fresh);
+    auto reuse = manager.inspect(program, FakePreparedPrompt{902}, make_base(902), 101);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 64,
+            "more valuable replacement was not reusable");
+}
+
+void test_shared_replacement_lifecycle_accounts_for_both_ids() {
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> trace(std::tmpfile(), &std::fclose);
+    require(bool(trace), "could not open lifecycle trace fixture");
+    using Manager = ninfer::runtime::ResourceManager<FakeModelContract, FrozenCaptureClock>;
+    Manager manager(1, 3, 1, true, 2, test_cost_model(), false, false, trace.get());
+    FakeProgram program;
+    for (unsigned index = 0; index < 2; ++index) {
+        const unsigned key = 1100 + index, frontier = index == 0 ? 8 : 12;
+        const auto active          = start_active(manager, program, key, make_base(key), index + 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = key, .frontier = frontier},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = frontier},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = key}, 0,
+                                               {}) == Manager::ActiveCaptureReserveResult::Reserved,
+                "lifecycle fixture did not reserve shared publication");
+        auto progress = manager.progress_context_transaction(program, {});
+        require(std::get<Manager::ActiveCaptureOutcome>(std::move(progress)).status ==
+                    ContextTransactionStatus::Published,
+                "lifecycle fixture did not publish");
+        (void)finish_active(manager, program, active);
+    }
+    std::rewind(trace.get());
+    std::string events;
+    for (int c; (c = std::fgetc(trace.get())) != EOF;) events.push_back(static_cast<char>(c));
+    require(events.find("op=CREATE reason=capture_publish id=1 frontier=8") != std::string::npos &&
+                events.find("op=CREATE reason=capture_publish id=2 frontier=12") !=
+                    std::string::npos,
+            "shared publication ids were not traced");
+    require(events.find("op=REPLACE reason=capture_publish id=1 frontier=8 next=2") !=
+                std::string::npos,
+            "normal capture overwrite lost its terminal lifecycle event");
+    require(events.find("op=SNAPSHOT") != std::string::npos,
+            "shared lifecycle has no complete catalog snapshot");
+}
+
+// The clock advances only on an actual assessment, so the economic discovery
+// episode is deterministic and logging/CPU scheduling cannot consume this budget.
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3896,6 +4060,12 @@ int main() {
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("test_dormant_shared_prior_allows_a_more_valuable_replacement",
+             test_dormant_shared_prior_allows_a_more_valuable_replacement);
+    run_test("test_shared_replacement_lifecycle_accounts_for_both_ids",
+             test_shared_replacement_lifecycle_accounts_for_both_ids);
+    run_test("test_dormant_shared_checkpoint_keeps_rebuild_prior_after_credit_expires",
+             test_dormant_shared_checkpoint_keeps_rebuild_prior_after_credit_expires);
     run_test("aborted shared capture logical rollback",
              test_aborted_shared_capture_start_rolls_back_logical_claims);
     run_test("validate complete capture result before adoption",

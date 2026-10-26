@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -58,7 +59,7 @@ struct CheckpointObservation {
 
 // ResourceManager owns logical policy only.  Every physical feasibility decision and mutation is
 // represented by an opaque ModelContract::ResourcePlan sealed against Program::resource_revision().
-template <class ModelContract>
+template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class ResourceManager {
 public:
     using Program                 = typename ModelContract::Program;
@@ -83,8 +84,8 @@ public:
     using StartResult                       = typename ModelContract::StartResult;
     using FinishResult                      = typename ModelContract::FinishResult;
     using AbortResult                       = typename ModelContract::AbortResult;
-    using Planner                           = MaterializationPlanner<ModelContract>;
-    using CapturePlanner                    = SharedCapturePlanner<ModelContract>;
+    using Planner                           = MaterializationPlanner<ModelContract, SearchClock>;
+    using CapturePlanner                    = SharedCapturePlanner<ModelContract, SearchClock>;
 
 private:
     // A transaction capability is a point-in-time structural snapshot. An active edge is a
@@ -249,12 +250,14 @@ public:
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
                     std::uint32_t max_long_anchors, ContextMachineCostModel cost_model,
-                    bool reclaim_private_for_capture = false)
+                    bool reclaim_private_for_capture = false, bool retain_dormant_shared = false,
+                    std::FILE* shared_lifecycle_trace = nullptr)
         : lane_count_(lane_count), catalog_count_(private_catalog_capacity),
           shared_catalog_count_(shared_catalog_capacity), cache_enabled_(cache_enabled),
           reclaim_private_for_capture_(reclaim_private_for_capture),
-          catalog_(private_catalog_capacity), shared_catalog_(shared_catalog_capacity),
-          session_index_(private_catalog_capacity),
+          retain_dormant_shared_(retain_dormant_shared),
+          shared_lifecycle_trace_(shared_lifecycle_trace), catalog_(private_catalog_capacity),
+          shared_catalog_(shared_catalog_capacity), session_index_(private_catalog_capacity),
           prefix_index_(checked_prefix_index_capacity(private_catalog_capacity,
                                                       shared_catalog_capacity, max_long_anchors)),
           max_long_anchors_(max_long_anchors), cost_model_(std::move(cost_model)) {
@@ -719,8 +722,9 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
-                    .private_retention_weight = 0,
-                    .explicit_shared_credit   = entry.explicit_credit,
+                    .private_retention_weight = shared_retention_weight(
+                        entry, committed_demand_mask_for(entry.summary.checkpoint.shortlist_key)),
+                    .explicit_shared_credit = entry.explicit_credit,
                 });
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
                     .owner      = owner,
@@ -1100,7 +1104,7 @@ public:
                 SharedCatalogEntry& entry = shared_catalog_[*shared];
                 const auto result         = program.release_shared_prefix(std::move(*entry.handle));
                 if (result.status != ConsumeStatus::Consumed) { break; }
-                clear_shared_entry(entry);
+                clear_shared_entry(entry, "lease_reclaim");
                 saturating_increment(context_stats_.pressure_shared_owners_evicted);
                 record_checkpoint_drops(context_stats_, 1);
                 rebuild_prefix_index();
@@ -1216,7 +1220,7 @@ public:
                     SharedCatalogEntry& evicted = shared_catalog_[*shared_victim];
                     const auto result = program.release_shared_prefix(std::move(*evicted.handle));
                     if (result.status != ConsumeStatus::Consumed) { break; }
-                    clear_shared_entry(evicted);
+                    clear_shared_entry(evicted, "idle_kv_eviction");
                     saturating_increment(context_stats_.pressure_shared_owners_evicted);
                     record_checkpoint_drops(context_stats_, 1);
                     ++out.released_owners;
@@ -1500,7 +1504,7 @@ public:
         }
         for (SharedCatalogEntry& entry : shared_catalog_) {
             entry.handle.reset();
-            clear_shared_entry(entry);
+            clear_shared_entry(entry, "cleanup");
         }
         for (SessionIndexEntry& entry : session_index_) { entry = {}; }
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
@@ -1696,6 +1700,14 @@ private:
     }
 
     static constexpr std::size_t kDemandWindowCapacity = 32U;
+
+    // A dormant shared capability still has a rebuild cost. Outside the observed/explicit
+    // demand window, charge one transition-loss prior rather than treating it as free to erase.
+    // This adds no value to new captures and does not double-count observed or explicit demand.
+    [[nodiscard]] std::uint32_t shared_retention_weight(const SharedCatalogEntry& entry,
+                                                        std::uint32_t demand_mask) const noexcept {
+        return retain_dormant_shared_ && !entry.explicit_credit && demand_mask == 0 ? 1U : 0U;
+    }
 
     static void append_unique(std::vector<PrefixShortlistKey>& destination,
                               const PrefixShortlistKey& key) {
@@ -1936,7 +1948,41 @@ private:
         advance_revision(entry.revision);
     }
 
-    void clear_shared_entry(SharedCatalogEntry& entry) noexcept {
+    void trace_shared(const char* op, const char* reason, const SharedCatalogEntry& entry,
+                      std::uint64_t next_id = 0, std::uint32_t next_frontier = 0) const noexcept {
+        if (!shared_lifecycle_trace_ || entry.id == 0) return;
+        const auto mask = committed_demand_mask_for(entry.summary.checkpoint.shortlist_key);
+        std::fprintf(shared_lifecycle_trace_,
+                     "SHARED_LIFECYCLE seq=%llu epoch=%llu op=%s reason=%s id=%llu frontier=%u "
+                     "next=%llu next_frontier=%u credit=%u expiry=%llu demand=%u prior=%u "
+                     "rebuild_ns=%llu residency=%u state=%u\n",
+                     static_cast<unsigned long long>(++shared_trace_seq_),
+                     static_cast<unsigned long long>(demand_epoch_), op, reason,
+                     static_cast<unsigned long long>(entry.id),
+                     entry.summary.checkpoint.ref.frontier,
+                     static_cast<unsigned long long>(next_id), next_frontier,
+                     unsigned(entry.explicit_credit),
+                     static_cast<unsigned long long>(entry.credit_expiry_epoch), mask,
+                     shared_retention_weight(entry, mask),
+                     static_cast<unsigned long long>(
+                         cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work)),
+                     unsigned(entry.summary.checkpoint.state_residency), unsigned(entry.state));
+    }
+
+    void trace_shared_snapshot() const noexcept {
+        if (!shared_lifecycle_trace_) return;
+        for (const auto& entry : shared_catalog_)
+            if (entry.id) trace_shared("LIVE", "request_finish", entry);
+        std::fprintf(
+            shared_lifecycle_trace_,
+            "SHARED_LIFECYCLE seq=%llu epoch=%llu op=SNAPSHOT reason=request_finish id=0\n",
+            static_cast<unsigned long long>(++shared_trace_seq_),
+            static_cast<unsigned long long>(demand_epoch_));
+        std::fflush(shared_lifecycle_trace_);
+    }
+
+    void clear_shared_entry(SharedCatalogEntry& entry, const char* reason) noexcept {
+        trace_shared("DROP", reason, entry);
         entry.state = SharedCatalogState::Vacant;
         entry.id    = 0;
         entry.handle.reset();
@@ -2237,7 +2283,10 @@ private:
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
-                .owner                  = owner,
+                .owner                    = owner,
+                .private_retention_weight = shared_retention_weight(
+                    entry,
+                    demand_mask_for(entry.summary.checkpoint.shortlist_key, provisional_demand)),
                 .explicit_shared_credit = entry.explicit_credit,
             });
             append_existing(owner, *entry.handle, entry.summary.checkpoint);
@@ -2440,8 +2489,10 @@ private:
                     .retention_class          = RetentionClass::SharedStable,
                     .selected_hit_count       = entry.observation.selected_hit_count,
                     .last_hit_epoch           = entry.observation.last_hit_epoch,
-                    .private_retention_weight = 0,
-                    .explicit_shared_credit   = entry.explicit_credit,
+                    .private_retention_weight = shared_retention_weight(
+                        entry, demand_mask_for(entry.summary.checkpoint.shortlist_key,
+                                               provisional_demand)),
+                    .explicit_shared_credit = entry.explicit_credit,
                 });
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner              = owner,
@@ -2830,11 +2881,13 @@ private:
                           committed.exact_resident_keys.end(),
                           entry.summary.checkpoint.shortlist_key) !=
                 committed.exact_resident_keys.end()) {
+                trace_shared("CONSUME_CREDIT", "exact_reuse", entry);
                 entry.explicit_credit     = false;
                 entry.credit_expiry_epoch = 0;
                 continue;
             }
             if (demand_epoch_ >= entry.credit_expiry_epoch) {
+                trace_shared("EXPIRE_CREDIT", "demand_window", entry);
                 entry.explicit_credit     = false;
                 entry.credit_expiry_epoch = 0;
             }
@@ -3110,7 +3163,7 @@ private:
         SharedCatalogEntry& entry   = shared_catalog_[slot];
         const std::uint32_t dropped = result.disposition == VictimDisposition::Evicted ? 1U : 0U;
         if (result.disposition == VictimDisposition::Evicted) {
-            clear_shared_entry(entry);
+            clear_shared_entry(entry, "pressure_eviction");
             saturating_increment(context_stats_.pressure_shared_owners_evicted);
             record_checkpoint_drops(context_stats_, dropped);
             return;
@@ -3119,6 +3172,9 @@ private:
             entry.state = SharedCatalogState::Catalogued;
             return;
         }
+        if (entry.summary.checkpoint.state_residency !=
+            result.final_summary->checkpoint.state_residency)
+            trace_shared("RESIDENCY", "pressure", entry);
         entry.summary = *result.final_summary;
         advance_revision(entry.revision);
         saturating_increment(context_stats_.pressure_shared_owners_degraded);
@@ -3548,11 +3604,11 @@ private:
             if (record->publication_slot != kInvalidCatalogSlot) {
                 SharedCatalogEntry& publication = shared_catalog_[record->publication_slot];
                 if (record->replacement_id != 0 && result.capacity_preparation_committed) {
-                    clear_shared_entry(publication);
+                    clear_shared_entry(publication, "capture_abort_committed");
                 } else if (record->replacement_id != 0) {
                     publication.state = SharedCatalogState::Catalogued;
                 } else {
-                    clear_shared_entry(publication);
+                    clear_shared_entry(publication, "capture_abort_empty");
                 }
             }
             observe_transfers(result);
@@ -3570,10 +3626,13 @@ private:
         }
         if (record->publishes_shared) {
             SharedCatalogEntry& publication = shared_catalog_[record->publication_slot];
+            auto new_id                     = next_shared_prefix_id_++;
+            if (new_id == 0) new_id = next_shared_prefix_id_++;
+            trace_shared("REPLACE", "capture_publish", publication, new_id,
+                         result.shared->summary.checkpoint.ref.frontier);
             publication.handle.reset();
-            publication.state = SharedCatalogState::Catalogued;
-            publication.id    = next_shared_prefix_id_++;
-            if (publication.id == 0) { publication.id = next_shared_prefix_id_++; }
+            publication.state                     = SharedCatalogState::Catalogued;
+            publication.id                        = new_id;
             publication.summary                   = result.shared->summary;
             publication.summary.active_references = 0;
             publication.handle.emplace(std::move(result.shared->handle));
@@ -3593,6 +3652,7 @@ private:
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
             advance_revision(publication.revision);
+            trace_shared("CREATE", "capture_publish", publication);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));
         }
@@ -3633,6 +3693,7 @@ private:
         }
         active.retained_private_source.reset();
         active.shared_sources.clear();
+        trace_shared_snapshot();
     }
 
     void release_cancelled_lane(LaneId lane) {
@@ -3846,11 +3907,14 @@ private:
         context_stats_.historical_fork_hits += result.operations.historical_fork_hits;
     }
 
-    std::uint32_t lane_count_           = 0;
-    std::uint32_t catalog_count_        = 0;
-    std::uint32_t shared_catalog_count_ = 0;
-    bool cache_enabled_                 = true;
-    bool reclaim_private_for_capture_   = false;
+    std::uint32_t lane_count_               = 0;
+    std::uint32_t catalog_count_            = 0;
+    std::uint32_t shared_catalog_count_     = 0;
+    bool cache_enabled_                     = true;
+    bool reclaim_private_for_capture_       = false;
+    bool retain_dormant_shared_             = false;
+    std::FILE* shared_lifecycle_trace_      = nullptr;
+    mutable std::uint64_t shared_trace_seq_ = 0;
     std::array<LogicalLaneState, kMaximumConcurrency> lanes_{};
     std::vector<CatalogEntry> catalog_;
     std::vector<SharedCatalogEntry> shared_catalog_;
