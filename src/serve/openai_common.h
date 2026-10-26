@@ -21,6 +21,7 @@ enum class OpenAIPromptCacheAutomatic : std::uint8_t {
 
 struct OpenAIPromptCachePolicy {
     OpenAIPromptCacheAutomatic automatic = OpenAIPromptCacheAutomatic::Default;
+    bool before_images                   = false;
 };
 
 [[nodiscard]] bool parse_openai_prompt_cache_breakpoint(const RequestJson& value,
