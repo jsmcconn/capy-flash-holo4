@@ -4062,9 +4062,6 @@ void test_dormant_shared_checkpoint_keeps_rebuild_prior_after_credit_expires() {
         .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
         .frontier = 64,
     });
-    const ActiveRequest seed   = start_active(manager, program, 96, seed_base, 1);
-    program.capture_assessment = FakeCaptureAssessment{
-        .shortlist_key          = FakeShortlistKey{.digest = 96, .frontier = 64},
     const auto seed            = start_active(manager, program, 901, seed_base, 1);
     program.capture_assessment = FakeCaptureAssessment{
         .shortlist_key          = FakeShortlistKey{.digest = 901, .frontier = 64},
@@ -4073,28 +4070,6 @@ void test_dormant_shared_checkpoint_keeps_rebuild_prior_after_credit_expires() {
         .publishes_shared       = true,
         .physically_feasible    = true,
     };
-    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 44}, 0, {}) ==
-                FakeManager::ActiveCaptureReserveResult::Reserved,
-            "lease fixture could not publish its shared prefix");
-    auto capture_progress = manager.progress_context_transaction(program, {});
-    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress)).status ==
-                ContextTransactionStatus::Published,
-            "lease fixture did not publish its shared prefix");
-    (void)finish_active(manager, program, seed);
-    const ActiveRequest answer = start_active(manager, program, 97, make_base(97), 2);
-
-    program.lease_private_pages[seed.sequence.id] = {0, 1, 2, 3};
-    program.lease_shared_pages[1]                 = {0, 1, 2, 3};
-    program.lease_device_pages                    = {0, 1, 2, 3};
-    program.lease_available_pages                 = 0;
-    program.lease_host_tier                       = false;
-    const std::uint32_t released = manager.reclaim_device_kv_for_lease(program, 1, 0, 1, 0);
-    require(released == 0 && program.released_continuations.empty() &&
-                program.released_shared_prefixes.empty() && program.lease_available_pages == 0,
-            "lease reclaim released a conversation whose pages a credited shared prefix keeps");
-    (void)finish_active(manager, program, answer);
-}
-
     require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 901}, 0,
                                            {}) == Manager::ActiveCaptureReserveResult::Reserved,
             "dormant shared fixture could not publish its source");
