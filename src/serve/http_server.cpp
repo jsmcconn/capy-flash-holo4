@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -287,6 +288,19 @@ bool authority_is_loopback(std::string_view authority) noexcept {
     }
     return is_ipv4_loopback_literal(authority);
 }
+
+bool authority_is_listed(std::string_view authority,
+                         const std::vector<std::string>& allowed_hosts) noexcept {
+    if (authority.empty()) { return false; }
+    return std::any_of(allowed_hosts.begin(), allowed_hosts.end(), [&](const std::string& allowed) {
+        return std::equal(authority.begin(), authority.end(), allowed.begin(), allowed.end(),
+                          [](char a, char b) {
+                              if (a >= 'A' && a <= 'Z') { a = static_cast<char>(a - 'A' + 'a'); }
+                              if (b >= 'A' && b <= 'Z') { b = static_cast<char>(b - 'A' + 'a'); }
+                              return a == b;
+                          });
+    });
+}
 } // namespace
 
 bool host_header_is_local(std::string_view host_header) noexcept {
@@ -302,6 +316,21 @@ bool origin_header_is_local(std::string_view origin_header) noexcept {
     const auto slash           = authority.find('/');
     if (slash != std::string_view::npos) { authority = authority.substr(0, slash); }
     return authority_is_loopback(authority);
+}
+
+bool request_headers_are_allowed(std::string_view host_header, std::string_view origin_header,
+                                 const std::vector<std::string>& allowed_hosts) noexcept {
+    if (!host_header_is_local(host_header) && !authority_is_listed(host_header, allowed_hosts)) {
+        return false;
+    }
+    if (origin_header_is_local(origin_header)) { return true; }
+    if (origin_header.starts_with("http://")) {
+        return authority_is_listed(origin_header.substr(7), allowed_hosts);
+    }
+    if (origin_header.starts_with("https://")) {
+        return authority_is_listed(origin_header.substr(8), allowed_hosts);
+    }
+    return false;
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
@@ -449,20 +478,21 @@ void HttpServer::register_routes() {
     // Local-only guard: active when we listen on a loopback address and the operator has not
     // opted into browser access with --cors. It blocks the two ways a web page in a victim's
     // browser can reach this server — a cross-site request (foreign Origin) and DNS rebinding
-    // (foreign Host) — before auth or body parsing. Non-browser clients send neither and are
-    // unaffected; to allow browsers, bind a non-loopback address or pass --cors.
+    // (foreign Host) — before auth or body parsing. Explicit proxy authorities use --allowed-host;
+    // --cors opts into unrestricted browser access.
     const bool local_only_guard = host_header_is_local(options_.host) && !options_.enable_cors;
     server_.set_pre_routing_handler(
         [this, local_only_guard](const httplib::Request& req, httplib::Response& res) {
             ensure_openai_request_id(req, res);
-            if (local_only_guard && !(host_header_is_local(req.get_header_value("Host")) &&
-                                      origin_header_is_local(req.get_header_value("Origin")))) {
+            if (local_only_guard && !request_headers_are_allowed(req.get_header_value("Host"),
+                                                                 req.get_header_value("Origin"),
+                                                                 options_.allowed_hosts)) {
                 ApiError error;
                 error.status  = 403;
                 error.type    = "invalid_request_error";
                 error.code    = "forbidden";
-                error.message = "refused a cross-origin or non-local request; bind a non-loopback "
-                                "address or pass --cors to allow browser clients";
+                error.message = "refused a cross-origin or non-local request; use --allowed-host "
+                                "for trusted proxy authorities or --cors for browser access";
                 if (req.path.rfind("/v1/messages", 0) == 0) {
                     write_anthropic_error(res, error, new_anthropic_request_id());
                 } else {

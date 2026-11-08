@@ -47,6 +47,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 //                           An empty Origin counts as local; "null" counts as non-local.
 [[nodiscard]] bool host_header_is_local(std::string_view host_header) noexcept;
 [[nodiscard]] bool origin_header_is_local(std::string_view origin_header) noexcept;
+// Loopback headers or explicitly trusted proxy authorities; foreign browser origins stay refused.
+[[nodiscard]] bool
+request_headers_are_allowed(std::string_view host_header, std::string_view origin_header,
+                            const std::vector<std::string>& allowed_hosts) noexcept;
 
 class HttpServer {
 public:

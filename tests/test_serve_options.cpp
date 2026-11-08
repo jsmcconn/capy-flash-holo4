@@ -48,6 +48,20 @@ int main() {
     }
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.allowed_hosts.empty(), "proxy authorities are trusted by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--allowed-host", "model.example:1235",
+                             "--allowed-host", "10.0.0.5:1235"})
+                              .allowed_hosts ==
+                          std::vector<std::string>({"model.example:1235", "10.0.0.5:1235"}),
+                      "repeated trusted proxy authorities were not retained");
+    for (const char* value : {"", "*", "https://model.example", "model.example/path",
+                              "user@model.example", "bad host"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--allowed-host", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid trusted proxy authority was accepted");
+    }
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures += check(!defaults.context_cache.retain_dormant_shared &&
                           !defaults.context_cache.trace_shared_lifecycle,

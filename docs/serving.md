@@ -1063,6 +1063,12 @@ curl http://127.0.0.1:8080/v1/models \
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 
+On a loopback listener, Host and Origin must be loopback authorities by default. A reverse proxy
+that preserves its public Host can use repeated `--allowed-host HOST[:PORT]` options, such as
+`--allowed-host model.example:1235`. Each entry matches the complete authority, case-insensitively,
+including its port when present. A browser Origin must also be loopback or name an explicitly
+listed authority over HTTP or HTTPS. The option leaves authentication and CORS headers unchanged.
+
 ## Server options
 
 The table lists executable defaults, without a `--profile` ([profiles](#profiles) set many of them). The
@@ -1146,6 +1152,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--reasoning-close-retry`, `--no-reasoning-close-retry` | a reply that ends with a terminal token inside its thinking (or right after `</think>` with blank content and no tool call) gets `"\n</think>\n\n"` appended and is continued once; text requests with prefix reuse only. Turn both guards off to compare outputs with another engine or to measure raw model behaviour | on |
 | `--chat-template FILE` | Jinja chat template used instead of the one embedded in the artifact; the capy-flash launchers pass `qwen3_8.jinja` ([Chat template](#chat-template)) | artifact's template |
 | `--cors` | permissive browser CORS headers | off |
+| `--allowed-host HOST[:PORT]` | trusted HTTP authority on a loopback listener; repeat for each proxy authority and include the port when present | none |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |

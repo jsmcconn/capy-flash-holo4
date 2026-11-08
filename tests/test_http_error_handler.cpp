@@ -109,6 +109,30 @@ int main() {
                           !ninfer::serve::origin_header_is_local("127.0.0.1:8080"),
                       "a foreign Origin was treated as loopback (cross-site guard open)");
 
+    const std::vector<std::string> proxy_hosts{"model.example:1235"};
+    failures += check(
+        !ninfer::serve::request_headers_are_allowed("model.example:1235", "", {}) &&
+            ninfer::serve::request_headers_are_allowed("MODEL.example:1235", "", proxy_hosts) &&
+            ninfer::serve::request_headers_are_allowed("model.example:1235",
+                                                       "http://model.example:1235", proxy_hosts) &&
+            ninfer::serve::request_headers_are_allowed("model.example:1235",
+                                                       "https://MODEL.example:1235", proxy_hosts),
+        "an explicitly trusted proxy authority did not reach the loopback server");
+    for (const std::string_view host :
+         {"model.example", "model.example:8080", "model.example:1235.attacker.example",
+          "model.example:1235@attacker.example", "other.example:1235"}) {
+        failures += check(!ninfer::serve::request_headers_are_allowed(host, "", proxy_hosts),
+                          "a proxy authority match accepted an unlisted host or port");
+    }
+    for (const std::string_view origin :
+         {"null", "https://other.example", "https://model.example:8080",
+          "https://model.example:1235/", "https://model.example:1235@other.example",
+          "file://model.example:1235"}) {
+        failures += check(
+            !ninfer::serve::request_headers_are_allowed("model.example:1235", origin, proxy_hosts),
+            "a trusted Host bypassed the foreign-Origin guard");
+    }
+
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";
     httplib::Response messages_response;

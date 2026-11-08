@@ -265,7 +265,7 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] "
-           "[--port N] [--api-key KEY|--api-key-file FILE] "
+           "[--port N] [--allowed-host HOST[:PORT]] [--api-key KEY|--api-key-file FILE] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
@@ -467,6 +467,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         };
         if (arg == "--host") {
             options.host = require_value("--host");
+        } else if (arg == "--allowed-host") {
+            std::string authority = require_value("--allowed-host");
+            if (authority.empty() ||
+                authority.find_first_of(" \t\r\n/?#@\\*") != std::string::npos) {
+                throw std::invalid_argument("--allowed-host needs a literal HTTP authority, "
+                                            "including its port when present");
+            }
+            options.allowed_hosts.push_back(std::move(authority));
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
