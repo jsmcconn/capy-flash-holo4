@@ -31,7 +31,8 @@ struct ServeOptions {
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                          // empty => no auth
+    std::vector<std::string> allowed_hosts; // Explicit HTTP authorities trusted behind a proxy.
+    std::string api_key;                    // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context            = 8192;
