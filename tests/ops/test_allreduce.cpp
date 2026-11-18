@@ -1233,12 +1233,7 @@ int run_peer_copy_publication_case(const char* case_label, std::int32_t n,
         for (int rank = 0; rank < 2; ++rank) { snapshot[rank][k] = allocate(rank, bytes); }
         one_sided[k] = allocate(0, bytes);
     }
-    std::array<Tensor, 2> gathered{};
-    std::array<Tensor, 2> part{};
-    for (int rank = 0; rank < 2; ++rank) {
-        gathered[rank] = Tensor(allocate(rank, 2 * bytes), DType::BF16, {n, 2});
-        part[rank]     = Tensor(pair.buffer[rank].data, DType::BF16, {n, 1});
-    }
+    std::array<void*, 2> gathered{allocate(0, 2 * bytes), allocate(1, 2 * bytes)};
     set_device(ec, 1);
     DeviceBuffer skew(kSkewBytes);
     retire_staging(ec);
@@ -1260,7 +1255,20 @@ int run_peer_copy_publication_case(const char* case_label, std::int32_t n,
                                              {one_sided[k], nullptr}, {bytes, 0}, ec, events) &&
                 served;
         }
-        ops::allgather_rows(gathered, part, ec, events);
+        // Each rank holds both final rows in rank order.
+        auto* rank0 = static_cast<std::uint8_t*>(gathered[0]);
+        auto* rank1 = static_cast<std::uint8_t*>(gathered[1]);
+        set_device(ec, 0);
+        cuda_check(cudaMemcpyAsync(rank0, pair.buffer[0].data, bytes, cudaMemcpyDeviceToDevice,
+                                   ec.dev[0]->stream),
+                   "final local row 0");
+        set_device(ec, 1);
+        cuda_check(cudaMemcpyAsync(rank1 + bytes, pair.buffer[1].data, bytes,
+                                   cudaMemcpyDeviceToDevice, ec.dev[1]->stream),
+                   "final local row 1");
+        served = ops::captured_peer_copy_pair({pair.buffer[1].data, pair.buffer[0].data},
+                                              {rank0 + bytes, rank1}, {bytes, bytes}, ec, events) &&
+                 served;
     });
     int failures = 0;
     if (!served) {
@@ -1302,9 +1310,8 @@ int run_peer_copy_publication_case(const char* case_label, std::int32_t n,
         image.insert(image.end(), s.back().begin(), s.back().end());
         for (int rank = 0; rank < 2; ++rank) {
             set_device(ec, rank);
-            failures +=
-                verify_exact((name + " gathered device " + std::to_string(rank)).c_str(),
-                             from_device<std::uint16_t>(gathered[rank].data, 2 * count), image);
+            failures += verify_exact((name + " gathered device " + std::to_string(rank)).c_str(),
+                                     from_device<std::uint16_t>(gathered[rank], 2 * count), image);
         }
     };
 
